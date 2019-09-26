@@ -1,0 +1,3 @@
+[submodule "variantcall/tranche-plot-arrange"]
+	path = variantcall/tranche-plots
+	url = git@github.com:rieseberglab/tranche-plot-arrange.git
