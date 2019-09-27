@@ -1,4 +1,4 @@
-# Phylogeny and dating of haplotypes
+# Phylogeny and dating for haploblocks
 
 * run_inv_phylogeny*.sh
    
