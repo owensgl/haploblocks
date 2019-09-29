@@ -1,0 +1,56 @@
+"""
+   Compiles the go code in a singularity container.
+"""
+
+import os.path
+import subprocess
+
+TOPDIR = os.path.abspath("../../..")
+GOSRC =  os.path.abspath("../../../src/genomics/")
+
+PROGRAMS = [os.path.join("..", "..", "..", "bin", progname) for progname in
+            ("vc", "align", "cas", "reduce")]
+
+VERSION = subprocess.check_output(["/bin/cat",
+                                   os.path.join(GOSRC, "VERSION")], shell=False).strip().decode()
+
+BUILDNO = subprocess.check_output("git rev-parse HEAD", shell=True).strip().decode()
+
+
+localrules: all
+
+rule all:
+    input: PROGRAMS
+
+def list_go_sources(wildcards):
+    listing = subprocess.check_output(["/usr/bin/find",
+                                       GOSRC,
+                                       "-type", "f",
+                                       "-name", "*.go",
+                                       "-not", "-path",
+                                       os.path.join(GOSRC, "vendor", "*")
+                                       ], shell=False)
+    #print(listing)
+    return [ s.decode() for s in listing.splitlines() ]
+
+rule compile_go:
+    input: list_go_sources
+    output: PROGRAMS
+    version:
+        VERSION + "-" + BUILDNO
+    log:
+        "logs/compile_go.log"
+    params:
+        topdir=TOPDIR,
+        gosrc=GOSRC
+    singularity:
+        "docker://rieseberglab/go-builder:2"
+    shell:
+        """
+        set -x;
+        : fake gopath -- expect repository is under HOME/SRC/REPO;
+        export GOROOT="";
+        export GOPATH="{params.topdir}:\\${{GOPATH}}";
+        ( cd "{params.gosrc}" && make dep; );
+        ( cd "{params.gosrc}" && make GOBIN="{params.topdir}/bin" install; );
+        """

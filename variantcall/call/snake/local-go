@@ -1,0 +1,72 @@
+#!/bin/bash
+
+set -euo pipefail
+
+#SAMPLE_FILE=HI.4530.readsetlinks.yaml
+#BATCH_NAME=HI.4530
+
+BATCHNAME=gwas
+
+SAMPLEFILES=(
+    # samples/HI.4549.samples.yaml
+    samples/test-sample-fragment-pass.yaml
+    # samples/test-samples.yaml
+)
+
+# get it into a form that snakemake --config can take
+samples_arraystr=$(python -c "import sys, json; print(json.dumps(sys.argv[1:]));" "${SAMPLEFILES[@]}")
+
+####
+
+PREFIXDIR=data
+CONTIGLIST="${CONTIGLIST:-${PREFIXDIR}/${BATCHNAME}/contig-list.txt}"
+
+SNK_CONFIG=(
+    "samplerange='1-2'"
+    "contigrange='1-200'"
+    "prefixdir=\"$PREFIXDIR\""
+    "samplefiles=${samples_arraystr}"
+    "batchname=\"$BATCHNAME\""
+    "contiglist=''" # start empty. we will generate later
+)
+
+SNK_XARGS=()
+while [[ "$#" -gt 0 ]]; do
+    arg="$1"
+    shift
+    case "$arg" in
+	--contiglist)
+	    CONTIGLIST="$1"
+	    shift
+	    ;;
+	--config)
+	    SNK_CONFIG+=("$1")
+	    shift
+	    ;;
+	*)
+	    SNK_XARGS+=("$arg")
+	    ;;
+    esac
+done
+
+function do_make ()
+{
+    # get top-level repo directory
+    SRCDIR=$(readlink -f "$(dirname "$0")"/../)
+    ARGS=(
+	--use-singularity
+	--singularity-args "-B /data/:/data/ -B ${SRCDIR}:${SRCDIR}"
+	--config "${SNK_CONFIG[@]}"
+	--jobs 4
+    )
+    set -x
+    snakemake "${ARGS[@]}" "$@"
+}
+
+if [[ ! -f "${CONTIGLIST}" ]]; then
+    do_make write_contig_list
+    mv "./contig-list.txt" "${CONTIGLIST}"
+fi
+
+SNK_CONFIG+=("contiglist='$(printf "%q" "${CONTIGLIST}")'")
+do_make "${SNK_XARGS[@]}" "$@"

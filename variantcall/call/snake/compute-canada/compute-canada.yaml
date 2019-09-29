@@ -1,0 +1,140 @@
+#
+# configuration file for running the snakemake pipeline
+# on compute canada
+#
+
+__default__:
+  ncpu: "1"
+  mem: "1G"
+  jobname: "{rule}_{wildcards}"
+  time: "01:00:00"
+  ntasks: "1"
+  ncpu: "4"
+  account: "{config[slurmaccount]}"
+  nodes: "1"
+  output: "logs/cluster_{rule}_{wildcards}.log"
+  exclusive: "user"
+  extra_args: ""
+
+call_align:
+  ncpu: "32"
+  mem: "84G"
+  time: "8:00:00"
+  extra_args: "--exclude='cdr[221,279,308,316,368,523,611,619,788,826,861]'"
+
+call_validate:
+  ncpu: "1"
+  mem: "24G"
+  time: "00:45:00"
+
+call_vc:
+  ncpu: "32"
+  mem: "124G" # overridden in Snakefile
+  time: "6:00:00"
+  exclusive: ""
+
+# it is difficult to predict how long it will take.
+# exponential in the number of samples covered.
+# 2400 samples takes about 30min per 1Mbp contig.
+call_gendb:
+  ncpu: "2"
+  mem: "24G" # 20 for Java. rest for tiledb
+  time: "01:00:00"
+  exclusive: ""
+
+# RAM requirement is exponential in the number
+# of samples covered. mem required is calculated
+# in Snakefile.
+call_vcf:
+  ncpu: "2"
+  time: "12:00:00"
+  exclusive: ""
+
+# for each contig:
+#  - import data in GenomicsDB (quick, and requires little memory)
+#  - perform joint genotyping on DB (slow, lots of memory)
+#
+# Memory requirements calculated in Snakefile.
+# config key contig_batch_size might need to be adjusted to run
+# within time allocation.
+#
+call_vcf_batch:
+  ncpu: "2"
+  jobname: "vcf_batch_{wildcards.call_uid}_{wildcards.interval_a}_{wildcards.interval_b}"
+  time: "12:00:00"
+  exclusive: ""
+
+# Produce a single tar of per-chromosome VCFs
+all_vcf_chrom_tar:
+  ncpu: "32"
+  time: "01:30:00"
+  exclusive: ""
+  mem: "24G"
+
+# memory configured via Snakefile
+call_vcf_chrom:
+  ncpu: "2"
+  time: "03:00:00"
+  exclusive: ""
+
+call_lane_merger:
+  ncpu: "4"
+  mem: "20G"
+  time: "02:00:00"
+
+compile_go:
+  ncpu: "1"
+  mem: "4G"
+  time: "00:20:00"
+
+# memory configured via Snakefile
+call_variant_model:
+  ncpu: "2"
+  time: "08:00:00"
+
+# memory configured via Snakefile
+call_vqsr_vcf:
+  ncpu: "1"
+  time: "04:00:00"
+
+# memory configured via Snakefile
+call_filter_vcf:
+  ncpu: "1"
+  time: "03:00:00"
+
+# memory configured via Snakefile
+call_bam_stats:
+  ncpu: "4"
+  time: "02:00:00"
+
+# memory configured via Snakefile
+call_vcf_chrom_sites_only:
+  ncpu: 1
+  time: "02:00:00"
+
+# memory configured via Snakefile
+call_vcf_chrom_excess_het:
+  ncpu: 1
+  time: "02:00:00"
+
+# memory configured via Snakefile
+call_gather_raw_chrom:
+  ncpu: 1
+  time: "03:00:00"
+
+# memory configured via Snakefile
+call_vcf_goldset:
+  ncpu: 1
+  time: "03:00:00"
+
+# memory configured via Snakefile
+call_beagle:
+  ncpu: 12
+  time: "02:00:00"
+  output: "logs/cluster_{rule}_{wildcards.call_uid}_{wildcards.contig_list_uid}_{wildcards.beagle_uid}_{wildcards.chrom_prefix}_{wildcards.filter_name}.log"
+
+# memory configured via Snakefile
+gather_vcf_beagle:
+  ncpu: 1
+  time: "00:20:00"
+  output: "logs/cluster_{rule}_{wildcards.beagle_uid}_{wildcards.call_uid}_{wildcards.contig_list_uid}.log"

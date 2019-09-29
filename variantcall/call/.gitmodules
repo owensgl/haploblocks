@@ -1,0 +1,6 @@
+[submodule "ngsdist/ngsTools"]
+	path = ngsdist/ngsTools
+	url = https://github.com/mfumagalli/ngsTools
+[submodule "ngsdist/kWIP"]
+	path = ngsdist/kWIP
+	url = https://github.com/kdmurray91/kWIP.git

@@ -1,0 +1,29 @@
+# Filters here are mostly generic, except ExcessHet, which you may
+# want to adjust.
+#
+# Notes:
+#   - Only variants satisfying ALL lines are kept. They are
+#     conjunctions.
+#
+#   - For columns that may or may not have a value in the VCF,
+#     you should check for NaN with isnan().
+#
+#   - MEAN_DP and SD_DP are not in the VCF, but are available
+#     as global variables. They are computed over all inputs
+#     before this filter is applied.
+#
+
+$V["Type"] == "Indel" || $V["Type"] == "SNP"
+!isnan($V["MQ"]) && !isnan($V["AN"]) && !isnan($V["SOR"])
+!isnan($V["AF"]) && !isnan($V["BaseQRankSum"])
+isnan($V["Filter"]) || tolower($V["Filter"]) == "pass"
+$V["MQ"] > 50.0
+$V["AN"] > MAX_AN*0.9
+$V["SOR"] < 1.0
+$V["SOR"] > -1.0
+$V["AF"] > 0.25
+$V["ExcessHet"] < 10.0
+$V["BaseQRankSum"] > -1.0
+$V["BaseQRankSum"] < 1.0
+$V["DP"] > MEAN_DP - SD_DP
+$V["DP"] < MEAN_DP + SD_DP

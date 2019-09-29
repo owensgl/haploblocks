@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+import sys, json
+
+def walk(obj, path):
+    lead = path.pop(0)
+    if lead[0] in "0123456789":
+        lead = int(lead, 10)
+    val = obj[lead]
+    if path:
+        return walk(val, path)
+    else:
+        return val
+
+if __name__ == "__main__":
+    key = sys.argv[1]
+    obj = json.load(sys.stdin)
+
+    val = walk(obj, key.split("."))
+
+    if isinstance(val, list):
+        for x in val: print(x)
+    else:
+        print(val)
+
+

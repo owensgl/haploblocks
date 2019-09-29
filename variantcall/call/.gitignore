@@ -1,0 +1,15 @@
+align/align
+controller/controller
+vc/vc
+reduce/reduce
+cscope.files
+cscope.in.out
+cscope.out
+cscope.po.out
+*~
+Gopkg.lock
+*.log
+vendor/
+bin/*
+.snakemake
+pkg/

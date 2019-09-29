@@ -1,0 +1,6 @@
+{"DBGBGBS_GB334":{
+"name":"DBGBGBS_GB334",
+"locations":[
+["http://cs.ubc.ca/~mihirn/DBGBGBS_GB334_R1.fastq.gz","file:/mnt/genomics/example-scripts/DBGBGBS_GB334_R1.fastq.gz.md5"],
+["http://cs.ubc.ca/~mihirn/DBGBGBS_GB334_R2.fastq.gz",""]
+]}}

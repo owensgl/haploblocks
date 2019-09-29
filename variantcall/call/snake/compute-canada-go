@@ -1,0 +1,88 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SAMPLEFILES=(
+    samples/renamed.samples-2.yaml
+    samples/HI.4559.samples.yaml
+    samples/HI.4530.samples.yaml
+    samples/HI.4549.samples.yaml
+    samples/external.samples-2.yaml
+    samples/perennials-debilis.yaml
+)
+
+# path where all data is stored in your home directory or scratch or
+# project. this is relative to Snakefile.
+# You can make this a symlink.
+SLURM_ACCOUNT=rrg-rieseber-ac
+
+# get it into a form that snakemake --config can take
+samples_arraystr=$(python -c "import sys, json; print(json.dumps(sys.argv[1:]));" "${SAMPLEFILES[@]}")
+
+
+SCRIPTS_DIR=$(cd "$(dirname "$0")"/scripts && pwd)
+
+SNK_CONFIG=(
+    "samplerange=\"1-\""
+    "contigrange=\"1-\""
+    "samplefiles=${samples_arraystr}"
+    "slurmaccount=\"${SLURM_ACCOUNT}\""
+)
+
+SNK_XARGS=()
+LOCAL_ONLY=0
+
+while [[ "$#" -gt 0 ]]; do
+    arg="$1"
+    shift
+    case "$arg" in
+	--config)
+	    # redefine a single key from the config
+	    SNK_CONFIG+=("$1")
+	    shift
+	    ;;
+	--local-only)
+	    # do not submit jobs to slurm
+	    LOCAL_ONLY=1
+	    ;;
+	--run-prefix)
+	    export RUN_PREFIX="$1"
+	    shift
+	    ;;
+	*)
+	    SNK_XARGS+=("$arg")
+	    ;;
+    esac
+done
+
+function do_make ()
+{
+    SRCDIR=$(readlink -f "$(dirname "$0")"/../)
+
+    if [[ "${LOCAL_ONLY}" == 1 ]]; then
+	SNK_ARGS=(
+	    --use-singularity
+	    --singularity-args "-B ${SRCDIR}:${SRCDIR} -B /scratch/:/scratch -B ${CONDA_PREFIX}:${CONDA_PREFIX} -B /project:/project -B /localscratch:/localscratch"
+	)
+    else
+	SNK_ARGS=(
+	    --profile "compute-canada"
+	    --singularity-args "-B ${SRCDIR}:${SRCDIR} -B /scratch/:/scratch -B ${CONDA_PREFIX}:${CONDA_PREFIX} -B /project:/project -B /localscratch:/localscratch"
+	)
+    fi
+
+    SNK_ARGS+=(
+	--config "${SNK_CONFIG[@]}"
+	--keep-going
+	#--restart-times 1
+	#--latency-wait 20
+    )
+
+    export GOPATH="${GOPATH:-${HOME}}" # for the compilation step
+    (
+	set -x
+	snakemake "${SNK_ARGS[@]}" "$@"
+    )
+}
+
+do_make "${SNK_XARGS[@]:+${SNK_XARGS[@]}}"

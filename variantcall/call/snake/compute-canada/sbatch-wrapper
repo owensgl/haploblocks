@@ -1,0 +1,153 @@
+#!/bin/bash
+
+#
+# Wrap sbatch invocation:
+#
+#    -- Capture just the job id from sbatch's output to pass back to
+#       snakemake.
+#
+#    -- Change resource requirements dynamically based on job resource
+#       properties defined in Snakefile (which can change between
+#       attempts)
+#
+#    -- Note that the argument parsing of this script is limiting. Pass
+#       sbatch parameters using the long form, i.e. "--flag=val"
+#
+
+exec 3>>./sbatch-wrapper.log
+
+function log_result ()
+{
+    echo "[$(date -Iseconds)] $@" >&3
+}
+
+#
+# get_prop ACCESSOR <<< jsonblob
+#
+# use 'o' as the object in the accessor
+# e.g. get_prop "o['foo']"
+#
+function get_prop ()
+{
+    local accessor="$1"
+    python -c "
+import json
+import sys
+o = json.load(sys.stdin)
+print(${accessor})
+"
+}
+
+function get_mem_mb ()
+{
+    local spec="$1"
+    local num="${spec:0:-1}"
+    case "$spec" in
+	*G)
+	    echo $((num * 1024))
+	    ;;
+	*K)
+	    echo $((num / 1024))
+	    ;;
+	*M)
+	    echo $num;
+	    ;;
+	*T)
+	    echo $((num * 1024 * 1024))
+	    ;;
+	*)
+	    return 1
+	    ;;
+    esac
+}
+
+
+log_result "$$ $(basename "$0") $@"
+
+ALL_ARGS=()
+MEM_MB=0
+JOB_NAME=''
+RUN_PREFIX="${RUN_PREFIX:-}"
+
+while [[ "$#" -gt 1 ]]; do
+    arg="$1"
+    shift
+    case "$arg" in
+	--mem=*)
+	    MEM_MB=$(get_mem_mb "${arg#*=}") || {
+		log_result "$$ can't parse memory requirement $arg"
+		exit 1
+	    }
+	    ;;
+	--job-name=*)
+	    JOB_NAME="${RUN_PREFIX}${arg#*=}"
+	    ;;
+	*)
+	    # omit all params ending with "=". As in `--exclusive=''`
+	    # this is because per-rule yaml settings cannot delete from
+	    # global defaults list.
+	    if [[ "${arg: -1}" != "=" ]]; then
+		ALL_ARGS+=("$arg")
+	    fi
+	    ;;
+    esac
+done
+JOB_SCRIPT="$1"
+shift
+
+JSON_PROPS=$(cat "$JOB_SCRIPT" | sed -n 's/^# properties =\(.*\)/\1/p')
+
+log_result "$$ props = ${JSON_PROPS}"
+
+#
+# Load memory requirement from Job properties json blob, if any.
+# Pick max value between cluster config and job property.
+#
+PROP_MEM=$(get_prop 'o.get("resources",{}).get("mem_mb", "")' <<<"${JSON_PROPS}")
+
+if [[ -n "${PROP_MEM}" ]]; then
+    log_result "$$ resources.mem_mb ${PROP_MEM}"
+    if [[ "${PROP_MEM}" -gt "${MEM_MB}" ]]; then
+	MEM_MB="${PROP_MEM}"
+	log_result "$$ bumped memory requirement to ${PROP_MEM}M"
+    fi
+fi
+
+if [[ -n "${JOB_NAME}" ]]; then
+    ALL_ARGS+=("--job-name=${JOB_NAME}")
+fi
+
+ALL_ARGS+=("--mem=$(( (MEM_MB + 1023) / 1024 ))G")
+log_result "$$ sbatch ${ALL_ARGS[@]} ${JOB_SCRIPT}"
+
+
+TRY_AGAIN=1
+while [[ "${TRY_AGAIN}" == 1 ]]; do
+    # success:
+    #   stdout: "Submitted batch job 5050492"
+    # error:
+    #   stderr: "batch: error: Batch job submission failed: Socket timed out on send/recv operation"
+    #
+    output=$(sbatch "${ALL_ARGS[@]}" "${JOB_SCRIPT}" 2>&1)
+
+    exitcode=$?
+    log_result "$$ result $exitcode: $output"
+
+    case "${output}" in
+	*Socket\ timed\ out*)
+	    sleep 2
+	    ;;
+	*)
+	    TRY_AGAIN=0
+	    ;;
+    esac
+done
+
+toks=( ${output} )
+
+if [[ "${#toks[@]}" -lt 1 ]]; then
+    exit 1
+fi
+
+echo "${toks[-1]}"
+exit ${exitcode}
