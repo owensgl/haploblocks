@@ -1,0 +1,29 @@
+# gold set for all_arg
+# cat data/gwas/merge/bases_mapped_3125b05a3a365178aa24064cc4f1be3af61c1136_all.txt | grep ^ARG | head -n 20
+#
+# Why only ARG*: (not DIV, GRO, etc)
+#  To create a truth set for variant recalibration, we selected the top
+#  N samples that had the highest number of aligned bases from the
+#  repeat depleted set. Although some earlier sequenced samples had a
+#  higher number of aligned bases, they had fewer usable bases because
+#  they were not depleted."
+ARG1805-8
+ARG1834-8
+ARG1805-10
+ARG1820-7
+ARG0204
+ARG0169
+ARG0054
+ARG0251
+ARG0010
+ARG0291
+ARG0259
+ARG0286
+ARG0062N
+ARG0031
+ARG0198
+ARG0180
+ARG0040
+ARG0067
+ARG0134N
+ARG0025
