@@ -22,6 +22,8 @@ configfile: "config.yaml"
 
 # Pipeline Overview:
 #
+# (steps of this pipeline are described in ../docs/pipeline.md)
+#
 # align each sample                    (rule: all_bam)
 # merge bams of same sample            (rule: all_merged)
 # do variant calling per-sample        (rule: all_gvcf)

@@ -20,7 +20,9 @@ Variant-Calling Pipeline
    | *all_vcf_chrom_sites_only* | Produces a smaller version of the unfiltered VCF where genotypic information has been removed. |
    | *all_vcf_goldset* | Produce a hard-filtered version of the raw VCF subset (which we call a "gold set"). The parameters for filtering are configurable. |
    | *all_variant_models* | Produce a recalibration model computed over one VCF with RAW SNPs, and using another hard-filtered VCF goldset |
-   | *all_vcf_chrom_filtered* | Apply the recalibrated model over the set of raw SNPs. Produces a the final VCF for this pipeline |
+   | *all_vcf_chrom_vqsr* | Apply the recalibrated model over the set of raw SNPs. Produces one file per chromosome. |
+   | *all_vcf_gather_filtered* | Apply a filter over the VQSR output. Produces a single large VCF with variants matching a filter specification |
+   | *all_vcf_chrom_beagle* | Calls beagle and plink on post VQSR filtered files. Produces vcf, tped and tfam files, per-chromosome |
 
    The pipeline command template is the following:
 
@@ -138,7 +140,7 @@ a variant call:
    ANN1000
    ...
    ANN1019
-   ```  
+   ```
    _Note: use your 20 highest-quality samples_
 
 4. Make a contig list
@@ -188,7 +190,7 @@ a variant call:
 6. Compute a raw VCF over the entire cohort.
 
    We can compute a set of RAW snps over the entire cohort. This does not yet use the goldset produced earlier.
-   
+
    ```bash
    ./compute-canada-go --run-prefix RAW1 --config "samplenames='./my_cohort.txt'" --config vcf_batch_size_kbp=12000 all_vcf_chrom
    ```
@@ -215,7 +217,7 @@ a variant call:
                     --config "goldset_snps='data/gwas/gold/goldset.snps.vcf.gz'" \
                     --config "goldset_indels='data/gwas/gold/goldset.indels.vcf.gz'" \
                     --config vcf_batch_size_kbp=12000 \
-                    all_vcf_chrom_filtered
+                    all_vcf_chrom_vqsr
    ```
 
    This will recalibrate a model using the goldset over the entire dataset, and apply a round of VQSR
@@ -228,12 +230,41 @@ a variant call:
    those of a subsequent invocation.
 
 
-8. Final round of filtering for GWAS
+8. Final round of filtering
 
-   TODO describe how to apply a custom filter to make the dataset ready for GWAS.
+   You can apply a subsequent round of filtering over files produced previously.
+   At this point you would pick a tranche of interest, and write a filter that
+   selects only variants from that tranche. You can apply additional filtering
+   constraints, like biallellic-only snps/indels.
 
-Job and resource Management
-===============
+   The filter to apply is configured via the config file by setting `vcf_filter`.
+   An example file is `snake/filters/AN90_tranche90_biallelic_snps`.
 
-TODO get status, get ETA, start/pause/stop/resume. how to adapt resource requirements for each job (ram, disk). how to control parallelism and threads.
+   ex:
 
+   ```bash
+   ./compute-canada-go \
+    ...
+    --config "vcf_filter='filters/AN50_tranche90_biallelic_snps'" \
+    --config 'vcf_filter_exclude_chrom_prefixes=[]' \
+    all_vcf_gather_filtered "$@"
+   ```
+
+   You would specify the snakemake targets `gather_vcf_filtered` to produce a single VCF file containing the variants
+   that remain.
+
+   You can also specify the target `all_vcf_chrom_beagle` (per-chromosome), or `all_beagle_gather` (single file for entire genome) to beagle and plink on filtered outputs and obtain phased VCF files:
+
+   ex:
+
+   ```bash
+   ./compute-canada-go \
+   ... \
+   --config "goldset_snps='${goldset_snps}'" \
+   --config "goldset_indels='${goldset_indels}'" \
+   --config "vcf_filter='filters/AN50_tranche90_biallelic_snps'" \
+   --config 'vcf_filter_exclude_chrom_prefixes=["HanXRQMT","HanXRQCP","HanXRQChr00c"]' \
+   all_beagle_gather "$@"
+   ```
+
+   Note: the exclusion list allows you to skip certain chromosomes, based on prefixes specified.
