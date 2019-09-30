@@ -1,4 +1,45 @@
 
+Manuscript Notes
+=================
+
+The scripts contained in this folder are part of a generic framework
+built for the purpose of calling variants in our compute-canada
+compute environment. There are several scripts and binaries involved,
+all orchestrated through Snakemake. The framework and its scripts are
+still in development in a separate repository
+(`github.com/rieseberglab/snp-calling`). What is included in this
+repository is a snapshot of the repository used to process the data
+published in the manuscript.
+
+The Snakefile (i.e. `snake/Snakefile`) constitutes a record of the
+commands invoked to process our samples. There is also a configuration
+file `snake/config.yaml` which contains some of the default settings
+we have used in our experiments. Some of the configuration parameters,
+namely controlling the size of jobs can be provided on the command line
+to one of the two launching scripts (local-go, and compute-canada-go) which
+are described below. Example commands are provided in [pipeline.md](./pipeline.md).
+
+The sample listings (e.g. urls, large downloaded files) and reference
+assemblies are not provided as part of this repository, but can be
+downloaded separately.
+
+Some steps in this snakefile invoke custom binaries written in
+Go. Those binaries are compiled from the source code under
+`src/genomics`, and invoked from a singularity container defined in
+the Snakefile. This singularity container is available publicly from
+dockerhub and contains specific versions of necessary genomics tools.
+
+Of those binary tools, `src/genomics/align` is a wrapper binary that
+performs trimming, mapping (with ngm), and marking of
+duplicates. Also, `src/genomics/vc` is a wrapper around gatk's
+`HaplotypeCaller`, and allows parallelizing the operation over a
+configurable number of threads. The other steps from the pipeline
+invoke external tools directly in the Snakefile, or via scripts in
+`snake/scripts/`.
+
+The following documentation is a general description/manual to use the
+framework.
+
 Reproducible Variant Calling
 ====================
 
