@@ -1,0 +1,7 @@
+genomics: go tools for variant calling.
+
+Copyright 2019 Jean-Sebastien Legare, Mihir Nanavati
+
+Both the license in LICENSE, and the copyright above apply to _all_
+files in the repository that are located in the directory (and
+subdirectories) containing this notice, unless otherwise specified.
