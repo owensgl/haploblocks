@@ -4,7 +4,6 @@
 #PBS -l nodes=1:ppn=6
 #PBS -l walltime=03:00:00
 #PBS -m bea
-#PBS -M drummond@biodiversity.ubc.ca
  
  
 ### Baypass under STD-IS model ###
