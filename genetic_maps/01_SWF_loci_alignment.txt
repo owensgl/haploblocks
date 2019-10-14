@@ -1,0 +1,5 @@
+#align SWF loci to Ha412 reference
+~/Programs/bwa-0.7.15/bwa mem ~/Reference/Ha412HOv2.0-20181130.fasta SFW_loci.fasta > SFW_loci_412.sam
+
+# filter alignments for MQ > 40 (same as cut-off for SNP filtering)
+~/Programs/samtools-1.3.1/samtools view -Sq 40 SFW_loci_412.sam | cut -f1,3-4 > SFW_loci_412_filtered.txt
