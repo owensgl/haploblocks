@@ -11,3 +11,11 @@
 * print_all_gea.R
     
     Printing all haploblock environment associations summary
+    
+* run_baypass_core_model.pbs
+
+   Running the core model of BayPass
+
+* run_baypass_cov_model.pbs
+
+   Running the covariate model of BayPass
