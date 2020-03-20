@@ -1,0 +1,29 @@
+# gold set for all_pet
+# cat data/gwas/merge/bases_mapped_071cbeccc05a7783ca25cd56299c328767072d77_all.txt | grep ^PET | head -n 20 | cut -f1 > samples/gold_sets/gold_pet.txt
+#
+# Why only PET*:
+#  To create a truth set for variant recalibration, we selected the top
+#  N samples that had the highest number of aligned bases from the
+#  repeat depleted set. Although some earlier sequenced samples had a
+#  higher number of aligned bases, they had fewer usable bases because
+#  they were not depleted."
+PET0316
+PET0654
+PET0636
+PET0337
+PET0473N
+PET0372
+PET0712
+PET0732
+PET0428
+PET0784
+PET0485
+PET0757
+PET0479
+PET0580
+PET0550
+PET0461
+PET0619
+PET0488
+PET0357
+PET0383

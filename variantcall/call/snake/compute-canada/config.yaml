@@ -1,0 +1,33 @@
+#
+#  Configuration for launching tasks in the compute-canada environment
+#
+
+local-cores: 1
+cluster: >-
+  compute-canada/sbatch-wrapper
+  --job-name={cluster.jobname}
+  --time={cluster.time}
+  --ntasks={cluster.ntasks}
+  --cpus-per-task={cluster.ncpu}
+  --account={cluster.account}
+  --nodes={cluster.nodes}
+  --output={cluster.output}
+  --mem={cluster.mem}
+  --exclusive={cluster.exclusive}
+  {cluster.extra_args}
+
+cluster-status: "compute-canada/sbatch-status.sh"
+max-jobs-per-second: 0.2
+max-status-checks-per-second: 2
+#
+# this is relative to the snakefile, which is inconvenient
+#
+cluster-config: "compute-canada/compute-canada.yaml"
+jobscript: "compute-canada/slurm-jobscript.sh"
+
+# number of jobs to submit simultaneously
+jobs: 200
+
+use-singularity: true
+# mount points
+singularity-args: "-B /scratch/:/scratch -B /project:/project -B /localscratch:/localscratch"

@@ -1,0 +1,34 @@
+#
+# conda env create -f environment.yaml -n genomics-py36
+#
+
+channels:
+  - conda-forge
+  - bioconda
+  - r
+  - defaults
+dependencies:
+  - gawk=4.2.1
+  - graphviz=2.38.0
+  - python=3.6.4
+  - tabix=0.2.5-0
+  - samtools=1.7
+  - bcftools=1.7
+  - parallel=20180322
+  - plink=1.90b4
+  - r=3.4.1
+  - r-ape=5.1
+  - r-phangorn=2.3.1
+  - r-optparse
+  - r-ggrepel
+  - bc=1.06
+  - r-ggplot2=3.0.0
+  - pip:
+      - "git+https://bitbucket.org/snakemake/snakemake.git@v4.7.0"
+
+# the singularity that is installed by regular users is not able
+# to create images or mount them. instead rely on a version installed
+# by root on the compute infrastructure -- most singularity versions
+# are compatible.
+#
+# - singularity=2.4.2

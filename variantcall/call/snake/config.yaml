@@ -1,0 +1,231 @@
+#
+# filename of file containing all sample definitions.
+# see `test-samples.yaml` for an example
+# this can be overridden with:
+#    snakemake --config samplefile=/path/to/file.yaml
+#
+samplefiles: ["test-sample-fragment-pass.yaml"]
+
+# samples to include in results. This is in "print dialog" syntax
+# examples:
+#    1,2,4  samples 1, 2, and 4
+#    1-3,5  samples 1 to 3 (incl.), and 5
+#    1-     samples 1 to infinity (all samples)
+samplerange: "1-"
+
+# precise list of samples to include in the run.
+# one name per line. comments allowed.
+# takes precedence over `samplerange`
+# samplenames: "samples.txt"
+
+#
+# for bookkeeping, we can separate runs obtained at
+# different times with a batch prefix.
+#
+prefixdir: "data"
+batchname: "gwas"
+
+# where aligned bam/bai end up
+# one bam+bai per sample
+aligndir:   "{prefixdir}/{batchname}/align/"
+
+# where the validation files end up.
+# making sure that the bam passes sanity checks
+validatedir: "{prefixdir}/{batchname}/validate/"
+
+# where merged bams end up if a sample has multiple
+# bams.
+mergedir: "{prefixdir}/{batchname}/merge/"
+
+# where the cytoplasmic bam files end up
+cytoplasmdir: "{prefixdir}/{batchname}/cytoplasm/"
+
+cytoplasm_contigs:
+  - HanXRQCP
+  - HanXRQMT
+
+
+# where raw g.vcf files end up
+# will contain one g.vcf file (plus index) per sample.
+gvcfdir: "{prefixdir}/{batchname}/gvcf/"
+
+# where assembled genomics db will end up
+# each genomicsdb is a subdirectory of this.
+# all batches are merged together in the same dir
+gendbdir: "{prefixdir}/{batchname}/gendb/"
+
+# where the raw vcf files will end up.
+# one vcf file per contig.
+jointcalldir: "{prefixdir}/{batchname}/raw_vcf/"
+
+# where the filtered vcf files will end up.
+# one vcf file per contig
+filtervcfdir: "{prefixdir}/{batchname}/vcf/"
+
+# cached downloads. content is retrievable if the digest of the file
+# (md5) is known (cas = content addressible storage). See
+# scripts/download-samples.py on how to populate this directory ahead of
+# time.
+#
+# this path needs to exist, but an empty directory is a valid cache
+# directory (trivial case).
+casdir: "data/nanuq_dl/"
+
+#
+# A directory of cached input parameters. can initially be empty.
+#
+paramsdbdir: "data/params/"
+
+#
+# where scratch files are placed
+#
+tmpdir: "data/tmp/"
+
+# genome reference file
+reference: "data/ref_genome/HanXRQr1.0-20151230.fa"
+
+# genome recombination map (for beagle)
+recombination_map: "data/ref_genome/HanXRQr1.0-20151230.bp_to_cM.280x801.plink.map"
+
+# all contigs in the reference.
+# flat file, one contig per line.
+#
+# Use scripts/generate-configs.sh to generate this list.
+# It should comprise all available contigs from the reference.
+#contiglist: "{prefixdir}/{batchname}/contig-list.txt"
+
+# restrict computations to a subset of all available contigs
+# defined by config.contiglist. This is in
+# "print dialog" syntax.
+# examples:
+#    1,2,4  contigs 1, 2, and 4
+#    1-3,5  contigs 1 to 3 (incl.), and 5
+#    1-     contigs 1 to infinity (all contigs)
+contigrange: "1-"
+
+#
+# The list of contigs on which to train the SN
+#
+modelcontigrange: "1-"
+
+#
+# These settings control the number and size of contigs/intervals to
+# process in each job.
+#
+contig_batch_size: 25
+vcf_batch_size_kbp: 4000
+# bias towards too many files within one batch. there is an overhead with
+# starting and stopping tasks.
+vcf_batch_size_ncontig: 50
+
+#
+# Batch this many bam stats calls into one job. It is a quick
+# operation which is dominated by job scheduling delays, so we
+# pack multiple per job.
+#
+stats_batch_size: 32
+
+# restrict computation on a subset of all available samples.
+# This is in "print dialog" syntax
+# examples:
+#    1,2,4  samples 1, 2, and 4
+#    1-3,5  samples 1 to 3 (incl.), and 5
+#    1-     samples 1 to infinity (all samples)
+samplerange: "1-"
+
+# regions BED file
+sortedbed: "data/ref_genome/HanXRQr1.0-20151230_allTEs_ubc.non-repetitive-regions.2017.sorted.bed"
+
+# regions to exclude from alignment
+exclusion: "data/ref_genome/PE-Marco.fa"
+
+# Credentials configuration to download fastq
+# samples over HTTP(S), e.g. from nanuq.
+#
+# Use `credsfile: ""` if no credentials are needed
+#
+# Format is yaml:
+#
+#     username: foo
+#     password: pass
+#     project:  myproj  (optional)
+#
+credsfile: "creds.yaml"
+
+# the truth-sensitivity tranches to compute during recalibration. the
+# gold model will be calculated with these tranche thresholds, and the
+# final VCF file will be filtered repeatedly with increasingly
+# selective tranches.
+recalibration_tranches:
+  - 100.0
+  - 99.0
+  - 90.0
+  - 70.0
+  - 50.0
+
+
+goldset_snps: "data/gold_set/SAM67.allgenome.goldset.snps.vcf.gz"
+goldset_indels: "data/gold_set/SAM67.allgenome.goldset.indels.vcf.gz"
+
+# where the goldsets end up
+goldset_dir: "{prefixdir}/{batchname}/gold/"
+
+#
+goldset_filter: "filters/generic_excess_het_10"
+
+#
+# the chromosome prefix names to gather together
+#
+gather_chrom_prefixes:
+  - HanXRQChr01
+  - HanXRQChr02
+  - HanXRQChr03
+  - HanXRQChr04
+  - HanXRQChr05
+  - HanXRQChr06
+  - HanXRQChr07
+  - HanXRQChr08
+  - HanXRQChr09
+  - HanXRQChr10
+  - HanXRQChr11
+  - HanXRQChr12
+  - HanXRQChr13
+  - HanXRQChr14
+  - HanXRQChr15
+  - HanXRQChr16
+  - HanXRQChr17
+  - HanXRQChr00c
+  - HanXRQMT
+  - HanXRQCP
+
+#
+# number of chromosomes to include in one call to
+# the variant recalibrator. the results will be
+# merged.
+#
+# set to 20 to do in one go
+variant_model_batch_size: 20
+
+#
+# The name of a filter to apply to the final output
+#
+# vcf_filter: "filters/AN90_tranche90_biallelic_snps"
+#
+# vcf_filter
+
+#
+# Names of chromosome prefixes to exclude from the filtering
+# output.
+#
+vcf_filter_exclude_chrom_prefixes:
+  - "HanXRQMT"
+  - "HanXRQCP"
+
+beagle_args:
+  - "impute=true"
+
+plink_args: []
+
+#slurmaccount: "rrg-rieseber-ac"
+slurmaccount: "rpp-rbruskie"
+

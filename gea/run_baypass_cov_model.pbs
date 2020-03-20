@@ -1,0 +1,43 @@
+#!/bin/bash
+#PBS -S /bin/bash
+#PBS -l mem=6000mb
+#PBS -l nodes=1:ppn=6
+#PBS -l walltime=03:00:00
+#PBS -m bea
+ 
+ 
+### Baypass under STD-IS model ###
+### bash script ###
+ 
+cd $PBS_O_WORKDIR
+echo "Current working directory is `pwd`"
+echo "Running on hostname `hostname`"   
+ 
+CORES=`/bin/awk 'END {print NR}' $PBS_NODEFILE`
+echo "Running on $CORES cores."
+ 
+# Make the intel environment available on Orcinus
+module load intel
+  
+## Directories:
+# Locate the input data
+ROOT_DIR=/home/gowens/data/baypass/cov_runs/ann
+GENO_DIR=${ROOT_DIR}/5k_genotype_files
+ENV_DIR=${ROOT_DIR}/env_var
+MATRIX_DIR=${ROOT_DIR}/matrix
+ 
+# Output directory
+OUTPUT_DIR=${ROOT_DIR}/baypass_COV_output_invfree
+ 
+## Input file
+BASENAME=baypass_geno_annuusHA412
+GENO=${GENO_DIR}/${BASENAME}_${PBS_ARRAYID}
+ENV=${ENV_DIR}/annuus_soils_scaled_outlier
+MAT=${MATRIX_DIR}/random1_ann_inv.free_anacore_mat_omega.out
+ 
+echo "Starting BayPass at: `date`"
+ 
+i_baypass -npop 70 -gfile ${GENO} -efile ${ENV} -omegafile ${MAT} -nthreads ${PBS_NUM_PPN} -outprefix ${OUTPUT_DIR}/ann_inv.free_HA412_anacovis_${PBS_ARRAYID}
+ 
+
+echo "Program finished with exit code $? at: `date`"

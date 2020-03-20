@@ -1,0 +1,4 @@
+.snakemake
+data
+creds.yaml
+__pycache__

@@ -1,0 +1,2645 @@
+import os, os.path
+import yaml
+import io
+import re
+
+# https://bitbucket.org/snakemake/snakemake/src/52286fe0cba1833d7d7474b99c9797be2116e09f/snakemake/remote/HTTP.py?at=master&fileviewer=file-view-default
+from snakemake.remote.HTTP import RemoteProvider as HTTPRemoteProvider
+from snakemake.exceptions import WildcardError
+from snakemake.logging import logger
+from collections import OrderedDict
+
+from helpers import Contig, utils as U, experiment as E
+
+# Uncomment for extra logging
+# from snakemake.logging import setup_logger
+# setup_logger(debug=True, printshellcmds=True)
+
+
+HTTP = HTTPRemoteProvider()
+
+configfile: "config.yaml"
+
+# Pipeline Overview:
+#
+# (steps of this pipeline are described in ../docs/pipeline.md)
+#
+# align each sample                    (rule: all_bam)
+# merge bams of same sample            (rule: all_merged)
+# do variant calling per-sample        (rule: all_gvcf)
+#
+# Joint calling:
+#   Option 1: one job per contig of interest
+#    combine results across samples in DB (rule: all_gendb)
+#    perform jointcalling on DB        (rule: all_vcf)
+#
+# OR
+#
+#   Option 2: run a batch of contigs in the same job
+#    perform jointcalling              (rule: all_vcf_batch)
+#    each batch is output in one tarball
+#
+# Gather interval VCFs into per-chrom VCFs (rule: all_vcf_chrom)
+# All VCFs are contained in a single tarball.
+#
+#
+# Report: obtain statistics on (merged) bam files (rule: all_bam_stats)
+#
+# You can use statistics on the BAM files to form a gold set. i.e. pick the
+# 20 samples with the most bases mapped. Then, make a list of the samplenames.
+#
+# Compute goldset of snps for recalibration model input: (rule: all_vcf_goldset)
+# You will want to set config.samplenames to the list of sample names to include
+# in the goldset, and possibly update config.contiglist to a subregion of the genome
+# (e.g. only the nuclear genome).
+#
+# Filter raw vcfs according to a recalibrated model: (rule: all_vcf_chrom_vqsr)
+# (Make sure your config has keys `goldset_snps` and `goldset_indels` set to the output
+# of the previous rule `all_vcf_goldset` output)
+#
+# report: write sample info file       (rule: write_sample_info)
+#   containing outputs and sample metadata
+#
+
+
+localrules: write_align_job, write_gendb_sample_map, write_intervals_list, write_sample_info, call_trivial_merger, all_bam, all_merged, all_bam_future, all_gvcf, all_gendb, all_vcf, all_vcf_chrom_vqsr, all_vcf_chrom, write_vcf_chrom_map, write_vcf_inputs_by_chrom_prefix_list, all_bam_stats, write_bam_stats_map, all_vcf_chrom_sites_only, call_bases_mapped, all_bases_mapped, write_merged_bam_list, write_goldset_params, all_vcf_goldset, write_vcf_filter_params, all_vcf_gather_filtered, write_beagle_params, all_beagle_gather, all_vcf_chrom_beagle
+
+# localrules: write_variant_model_vcf_list
+
+def _no_inputs(wildcards):
+    return []
+
+Experiment = E.ExperimentParams.from_config(config)
+
+def _all_vcf_batch_intervals(contig_list_uid):
+    """Split the selected contigs into a list of (contig_a, contig_b) non-overlapping
+       intervals according to config settings and return that list of tuples.
+    """
+    all_contigs = E.get_contig_slice_by_uid(contig_list_uid)
+    batch_size  = config.get('vcf_batch_size_kbp', 5000) * 1000
+    ncontig_max = config.get('vcf_batch_size_ncontig', 50)
+
+    if _all_vcf_batch_intervals.cache.get((contig_list_uid, batch_size, ncontig_max)):
+        return _all_vcf_batch_intervals.cache.get((contig_list_uid, batch_size, ncontig_max))
+
+    intervals = []
+
+    start_i = 0
+    while start_i < len(all_contigs):
+        start_contig = all_contigs[start_i]
+        end_i = start_i # at least one contig in the batch
+        cur_batch_remaining = batch_size - start_contig.size
+        cur_batch_ncontig = 1
+        for next_i in range(start_i + 1, len(all_contigs)):
+            next_contig = all_contigs[next_i]
+            # advance until it doesn't fit
+            if cur_batch_remaining >= next_contig.size and cur_batch_ncontig < ncontig_max:
+                cur_batch_remaining -= next_contig.size
+                end_i = next_i
+                cur_batch_ncontig += 1
+            else:
+                break
+
+        ival_a = all_contigs[start_i]
+        ival_b = all_contigs[end_i]
+
+        intervals.append((ival_a, ival_b))
+        # start the next batch with the next contig
+        start_i = end_i + 1
+
+    _all_vcf_batch_intervals.cache[(contig_list_uid, batch_size, ncontig_max)] = intervals
+
+    return intervals
+
+_all_vcf_batch_intervals.cache = {}
+
+def _contigs_by_chrom_map(contig_list_uid):
+    """
+    Return a mapping from chromosome name to a list of contigs in that chromosome.
+    """
+    if _contigs_by_chrom_map.cache.get(contig_list_uid):
+        return _contigs_by_chrom_map.cache.get(contig_list_uid)
+
+    all_contigs  = E.get_contig_slice_by_uid(contig_list_uid)
+    per_chrom = OrderedDict()
+    for contig in all_contigs:
+        per_chrom.setdefault(contig.chrom, list()).append(contig)
+
+    _contigs_by_chrom_map.cache[Experiment.contig_list_uid] = per_chrom
+    return per_chrom
+
+_contigs_by_chrom_map.cache = {}
+
+def _contigs_by_chrom_prefix(contig_list_uid, chrom_prefix):
+    """get the list of Contig objects part of a chromosome whose name begins with chrom_prefix
+
+       the main reason for using a prefix instead of an exact match is
+       to allow bundling the HanXRQChr00cXXXX bits together.
+
+       All other chromosome names have a unique prefix.
+    """
+    chrom_contigs = _contigs_by_chrom_map(contig_list_uid)
+    selected_contigs = []
+
+    for chrom_name in chrom_contigs:
+        if chrom_name.startswith(chrom_prefix):
+            selected_contigs += chrom_contigs[chrom_name]
+    return selected_contigs
+
+def _intervals_by_chrom_map(contig_list_uid):
+    """builds a mapping from chrom_name => list of contig intervals"""
+    if _intervals_by_chrom_map.cache.get(contig_list_uid):
+        return _intervals_by_chrom_map.cache.get(contig_list_uid)
+
+    intervals = _all_vcf_batch_intervals(contig_list_uid)
+    all_contigs = E.get_contig_slice_by_uid(contig_list_uid)
+    index_of = {}
+    for i, contig in enumerate(all_contigs):
+        index_of[contig] = i
+
+    # chrom_name -> [ ival1, ival2, ...]
+    chrom_map = OrderedDict()
+
+    for ival in intervals:
+        contig_a, contig_b = ival
+        index_a, index_b = index_of[contig_a], index_of[contig_b]
+        ival_chroms = OrderedDict()
+
+        for ival_contig in all_contigs[index_a:index_b+1]:
+            ival_chroms[ival_contig.chrom] = True
+
+        for ival_chrom in ival_chroms:
+            chrom_map.setdefault(ival_chrom, []).append(ival)
+
+    _intervals_by_chrom_map.cache[contig_list_uid] = chrom_map
+    return chrom_map
+_intervals_by_chrom_map.cache = {}
+
+def _intervals_by_chrom_prefix(contig_list_uid, chrom_prefix):
+    """get the list of contig batch intervals containing bits
+       for chromosomes whose name start with chrom_prefix
+
+       the list of intervals returned has no duplicates.
+    """
+    chrom_to_ival = _intervals_by_chrom_map(contig_list_uid)
+    chrom_intervals = []
+
+    uniq_ival = {}
+
+    for chrom_name in chrom_to_ival:
+        if chrom_name.startswith(chrom_prefix):
+            for ival in chrom_to_ival[chrom_name]:
+                if ival not in uniq_ival:
+                    # consecutive chromosomes may have intervals in common.
+                    uniq_ival[ival] = True
+                    chrom_intervals.append(ival)
+    return chrom_intervals
+
+def _get_valid_chrom_prefixes(contig_list_uid):
+    """
+    get the list of chromosome prefixes that are valid, given the list of contigs
+    """
+    if _get_valid_chrom_prefixes.cache.get(contig_list_uid):
+        return _get_valid_chrom_prefixes.cache.get(contig_list_uid)
+
+    non_empty_prefixes = [prefix for prefix in config["gather_chrom_prefixes"]
+                          if len(_contigs_by_chrom_prefix(contig_list_uid, prefix)) > 0]
+    _get_valid_chrom_prefixes.cache[contig_list_uid] = non_empty_prefixes
+    return non_empty_prefixes
+
+_get_valid_chrom_prefixes.cache = {}
+
+def pre_process_config():
+    """
+    this function processes the keys in the config, sanitizes user input, and
+    caches the results in a way that is quickly reusable in the tasks that are
+    forked by the snakemake controller
+
+    this function runs on every invocation of the workflow
+    """
+
+    # expand variables inside specific keys of the config
+    expanded_keys = ("aligndir", "gvcfdir", "validatedir", "gendbdir",
+                     "casdir", "paramsdbdir", "contiglist", "jointcalldir",
+                     "filtervcfdir", "mergedir", "cytoplasmdir", "goldset_dir")
+
+    for key in expanded_keys:
+        if not key in config:
+            logger.run_info("key %s is missing from the config" % (key,))
+
+        before = config[key]
+        try:
+            repl_dict = {k:v for k,v in config.items() if isinstance(v, str)}
+            exp = expand(str(config[key]), **repl_dict)
+            if not exp:
+                config[key] = ""
+            else:
+                config[key] = exp[0]
+        except WildcardError as wce:
+            raise Exception("could not process configuration item `%s: %s`: %s" % (key, before, str(wce)))
+        logger.run_info("config %20s: %s" % (key, config[key]))
+
+    # check valid directories
+    for k_dir in ["aligndir", "gvcfdir", "validatedir", "gendbdir",
+                  "casdir", "tmpdir", "paramsdbdir", "jointcalldir",
+                  "filtervcfdir", "mergedir", "cytoplasmdir", "goldset_dir"]:
+        check_dir = config.get(k_dir, "")
+        if not os.path.isdir(check_dir):
+            raise Exception("config.%s: %s should be a valid directory." % (k_dir, check_dir))
+
+    # this will save/cache the config parameters for the run.
+    config['paramsdb'] = U.Cas(config['paramsdbdir'])
+
+    # load samples from a unique sample definition produced during a previous run.
+    # allows reproducibility.
+    def _load_samples_from_slice():
+        return E.get_sample_slice_by_uid(config['sample_slice_uid'])
+
+    # load samples from source files.
+    # they are keyed by sample name, and then by lane.
+    def _load_samples_from_source():
+        sample_db = OrderedDict()
+        for samplefile in config['samplefiles']:
+            with open(samplefile, "r") as samplefilefd:
+                samples_document = yaml.load(samplefilefd)
+                default_lane = samples_document.get("lane", None)
+
+                if not "samples" in samples_document:
+                    raise Exception("Expected a `samples` dictionary in sample file %s" % (fil,))
+                for samplei, sample in enumerate(samples_document['samples']):
+                    if not 'name' in sample:
+                        raise Exception("Sample #%d in file %s is missing a field `name`", samplei+1, fil)
+                    lane = sample.get('lane', default_lane)
+                    if not lane:
+                        raise Exception("Sample #%d in file %s does not have `lane` information." % (samplei+1, fil))
+
+                    sample.setdefault('lane', lane)
+                    by_name = sample_db.get(sample['name'], None)
+                    if by_name is None:
+                        by_name = OrderedDict()
+                        sample_db[sample['name']] = by_name
+                    if lane in by_name:
+                        raise Exception("Sample #%d in file %s overwrites information for sample name %s3, lane %s" % (
+                            samplei+1, fil, sample['name'], lane))
+                    by_name[lane] = sample
+        return sample_db
+
+    # The list of samples to process has already been prepared.
+    # Do not rebuild from scratch. Load existing file.
+    if config.get('sample_slice_uid'):
+        config['sample_slice'] = _load_samples_from_slice()
+    else:
+        if "samplefiles" not in config:
+            raise Exception("`samplefiles` must be defined in the config as an array of filenames containing sample definitions.")
+
+        sample_db = _load_samples_from_source()
+
+        # keep the order of samples defined by the files
+        all_samples = [ sample_db[name] for name in sample_db.keys() ]
+
+        if config.get("samplenames"):
+            # the subset of samples to process is passed as a filename
+            with open(config['samplenames'], "r") as namesfd:
+                names = []
+                for line in namesfd:
+                    line = line.strip()
+                    if not line or line.startswith("#"): continue
+                    names.append(line)
+            config['sample_slice'] = E.get_sample_slice_by_name(all_samples, names)
+        else:
+            # the subset of samples to process is passed as a sample range (numbers start-end).
+            # sanitize the sample range.
+            samplerange = config.get('samplerange', "1-").replace(" ", "")
+
+            # determine the samples that we will use for this run
+            # this is a view/subset of samples defined in the config file
+            config['sample_slice'] = E.get_sample_slice_by_number(all_samples, samplerange)
+
+        sample_names = [name for name in config['sample_slice'].keys()]
+        sample_names.sort()
+
+        # We save the subset of samples to paramsdb and cache for later runs.
+        with io.BytesIO() as datafile:
+            for name in sample_names:
+                record = {"name": name, "val": config['sample_slice'][name]}
+                datafile.write((json.dumps(record, sort_keys=True, separators=(",",  ":")) + "\n").encode('utf-8'))
+            datafile.seek(0)
+            config['sample_slice_uid'] = config['paramsdb'].put_stream(datafile)
+
+    ## Load Contig definitions from file
+    if not config.get('contig_list_uid'):
+        # save list of contigs to paramsdb
+        if not config.get('contiglist'):
+            logger.error("\n".join("You must provide a contig list over the reference.",
+                                   "The contig list defines the windows over which computations are made.",
+                                   "You may generate a contig list from the reference with: ./scripts/generate-contigs.sh <ref_genome> > <contiglist>"))
+            raise Exception("`contiglist` must be defined in the config.")
+
+        # sanitize the contig range
+        contigrange = config.get('contigrange', "1-").replace(" ", "")
+
+        with open(config['contiglist'], "r") as contigfd:
+            all_contigs = E._contigs_from_file(contigfd)
+
+        # determine the contigs that we will use for this run
+        # this is a view over all available contigs
+        config['contig_slice'] = E.get_contig_slice_by_number(all_contigs, contigrange)
+        with io.BytesIO() as datafile:
+            for contig in config['contig_slice']:
+                datafile.write((contig.to_file() + "\n").encode("utf-8"))
+            datafile.seek(0)
+            config['contig_list_uid'] = config['paramsdb'].put_stream(datafile)
+    else:
+        config['contig_slice'] = E.get_contig_slice_by_uid(config['contig_list_uid'])
+
+    # let the workers use cached run settings.  workflow.config_args get passed
+    # down to submitted subtasks as command line arguments. flags passed
+    # here will be inherited by subworkers
+    for save_setting in ('sample_slice_uid', 'contig_list_uid'):
+        for setting in workflow.config_args:
+            # setting already set. e.g. contig_list_uid='xxx'
+            if setting.startswith(save_setting + "="): break
+        else:
+            # no such setting
+            workflow.config_args.append('%s=%s' % (save_setting, json.dumps(config[save_setting])))
+
+    # print run information
+    for key, value_key in (("samplerange", "sample_slice"), ("contigrange", "contig_slice")):
+        values = config[value_key]
+        logger.run_info("config %20s: %s  (%d total entries)" % (key, config[key], len(values)))
+
+    # more run information
+    logger.run_info("config %20s: %s" % ("samplefiles", " ".join(config['samplefiles'])))
+    logger.run_info("config %20s: %s" % ('sample_slice_uid', config['sample_slice_uid']))
+    logger.run_info("config %20s: %s" % ('contig_list_uid',  config['contig_list_uid']))
+
+    logger.run_info("config samples selected (at most 100 shown): %s" % (" ".join([k for k in config['sample_slice']][:100])))
+
+    # check desired prefixes to see if they are valid, given the contigrange
+    non_empty_prefixes = _get_valid_chrom_prefixes(Experiment.contig_list_uid)
+    extra = set(config['gather_chrom_prefixes']) - set(non_empty_prefixes)
+    if len(extra) > 0:
+        logger.warning("Some chromosomes are excluded by the contigrange: %s" % (extra,))
+
+pre_process_config()
+
+# Separate Snakefile which compiles go code in the repo
+subworkflow compile_workflow:
+    workdir: "./subworkflows/compile"
+    snakefile: "./subworkflows/compile/Snakefile"
+
+rule compile:
+    input:
+        vc_bin=compile_workflow("../../../bin/vc"),
+	align_bin=compile_workflow("../../../bin/align"),
+
+def _get_align_job_inputs(lane, sample_name):
+    """
+    Read the config, keyed by "sample" and extract the urls of the two
+    fastq-formatted read files, and their associated md5 urls
+    """
+    input_sample = config['sample_slice'].get(sample_name, {}).get(lane, None)
+    if not input_sample:
+        raise Exception("Could not find sample %s from lane %s" % (sample_name, lane))
+
+    if not 'fastq' in input_sample['locations']:
+        raise Exception("Expected config for sample {} to specify locations.fastq".format(sample_name))
+
+    locations = input_sample['locations']
+    fastqs = locations['fastq']
+    md5s   = locations['md5'] if 'md5' in locations else ["", ""]
+    while len(md5s) < 2:
+        md5s.append("")
+
+    all_inputs = {
+        "r1": fastqs[0],
+        "r2": fastqs[1],
+    }
+    if md5s[0]:
+        all_inputs["r1_hash"] = md5s[0]
+    if md5s[1]:
+        all_inputs["r2_hash"] = md5s[1]
+
+    return all_inputs
+
+def get_align_job_file_dependencies(wildcards):
+    #
+    # FIXME We remove inputs that are not files.  Snakemake can work
+    # with HTTP remote urls, but it "pings" them each time with a HEAD
+    # http request to detect if the file modification date changed on
+    # the remote end. Ideally this would need to be changed in such a
+    # way that MD5s are determined ahead of time, and encoded in the
+    # URLs.
+    #
+    all_inputs = _get_align_job_inputs(wildcards.lane, wildcards.sample)
+
+    def _is_url(url):
+        return url.startswith("http://") or url.startswith("https://") or url.startswith("hash://")
+
+    def _is_file_url(url):
+        return url.startswith("file://")
+
+    file_inputs = {}
+    for key in all_inputs.keys():
+        if not _is_url(all_inputs[key]):
+            if _is_file_url(all_inputs[key]):
+                file_inputs[key] = all_inputs[key][len("file://"):]
+            else:
+                file_inputs[key] = all_inputs[key]
+
+    return file_inputs
+
+rule write_align_job:
+    input:
+        #"config.yaml",
+        unpack(get_align_job_file_dependencies),
+    output:
+        os.path.join(config['aligndir'], "{lane}", "align_{sample}.job")
+    run:
+        all_inputs = _get_align_job_inputs(wildcards.lane, wildcards.sample)
+
+        # the jobobject json file format is defined in ../common/
+        jobobject = {
+            wildcards.sample: {
+                "name": wildcards.sample,
+                "locations": [
+                    [all_inputs["r1"], all_inputs.get("r1_hash", "")],
+                    [all_inputs["r2"], all_inputs.get("r2_hash", "")]]
+                }
+        }
+        #print(output[0] + ":", jobobject)
+        with open(output[0] + ".tmp", "w+") as tmpfile:
+            json.dump(jobobject, tmpfile)
+        os.rename(output[0] + ".tmp", output[0])
+
+rule call_align:
+    """ fastq => bam/bai """
+    params:
+        credsfile=config["credsfile"],
+	align_bin="../bin/align",
+	casdir=config['casdir']
+    input:
+        reference=config['reference'],
+        exclusion=config['exclusion'],
+        jobfile=os.path.join(config['aligndir'], "{lane}", "align_{sample}.job")
+    output:
+        bam=os.path.join(config['aligndir'], "{lane}", "{sample}.bam"),
+        bai=os.path.join(config['aligndir'], "{lane}", "{sample}.bam.bai"),
+    log:
+        os.path.join(config['aligndir'], "{lane}", "{sample}.bam.log")
+    singularity:
+        "docker://rieseberglab/analytics:2"
+    threads: 32
+    shell:
+        """
+        exec >>{log} 2>&1;
+        set -exo pipefail;
+        mkdir -p \\$(dirname {output.bam}) \\$(dirname {log});
+        workdir=\\$(mktemp -d -p {config[tmpdir]} tmp.call_align.XXXXXX);
+        trap 'find \\${{workdir}} || : ; rm --one-file-system -r -- \\${{workdir}}' EXIT;
+        ulimit -c 0; ulimit -Hc 0;
+
+        [[ -e {input.reference} ]] || {{ echo no access to file {input.reference} >&2; exit 100; }};
+        [[ -e {input.jobfile}   ]] || {{ echo no access to file {input.jobfile}   >&2; exit 101; }};
+        [[ -e {input.exclusion} ]] || {{ echo no access to file {input.exclusion} >&2; exit 102; }};
+        OUTDIR=\\$(dirname {output.bam});
+        mkdir -p \\$OUTDIR;
+        time {params.align_bin} \
+	  -cas {params.casdir} \
+	  -r file:{input.reference} \
+	  -i file:{input.jobfile} \
+	  -x file:{input.exclusion} \
+	  -o file:\\$OUTDIR \
+          -n {threads} \
+          -w \\${{workdir}} \
+          -sb \
+          -m \
+          -creds {params.credsfile} \
+	  -lossy \
+          -d 1
+        """
+
+def _bam_cache(lane, samplename, fmt="bam"):
+    """allow a bam or bai to come from the config instead of the workflow"""
+    if not samplename in config['sample_slice']:
+        raise Exception("_bam_cache: unknown sample %s" % (samplename,))
+    sample_spec = config['sample_slice'][samplename]
+    if not lane in sample_spec:
+        raise Exception("_bam_cache: unknown lane %s for sample %s" % (lane, samplename))
+    sample_spec = sample_spec[lane]
+
+    url = sample_spec.get('locations', {}).get(fmt, None)
+    if not url:
+        return None
+
+    if url.startswith("file://"):
+        file_path = os.path.expanduser(url.split("://", 1)[1])
+        return [file_path]
+    else:
+        raise Exception("_bam_cache: bam file for sample {} lane {} in config must start with file://".format(samplename, lane))
+
+rule call_validate:
+    """verifies that all the bam files in the alignment directory pass SAM checks"""
+    output:
+        os.path.join(config['validatedir'], "{lane}", "validate_{sample}.txt")
+    input:
+        bam=(lambda wildcards: _bam_cache(wildcards.lane, wildcards.sample, fmt="bam") or rules.call_align.output.bam)
+    params:
+        validatedir=config['validatedir'],
+        aligndir=config['aligndir'],
+        picardjar="/home/picard-2.9.3.jar"
+    log:
+        "logs/call_validate_{lane}_{sample}.log"
+    singularity:
+        "docker://rieseberglab/analytics:2"
+    threads: 1
+    shell:
+        """exec >>{log} 2>&1; \
+        mkdir -p {params.validatedir}/{wildcards.lane}/ && \
+        java -jar {params.picardjar} \
+            ValidateSamFile I={input.bam} M=SUMMARY \
+            IGNORE=MISMATCH_FLAG_MATE_NEG_STRAND | tee {output}.tmp; \
+        mv "{output}.tmp" "{output}"
+        """
+
+def _get_unmerged_bams(samplenames, fmt="bam"):
+    """returns an array of non-merged bam file dependencies for a given
+       samplename. this corresponds to the collective set of all bam
+       files across all flowcell lanes that include that sample.
+    """
+    if isinstance(samplenames, str):
+        samplenames = [samplenames]
+    files = []
+    for samplename in samplenames:
+        lanes = config['sample_slice'][samplename]
+        for lane in lanes:
+            if fmt in ("bam", "bai"):
+                files += _bam_cache(lane, samplename, fmt=fmt) or expand(rules.call_align.output[fmt], sample=samplename, lane=lane)
+            elif fmt in ("validated",):
+                if _bam_cache(lane, samplename, fmt='bam'):
+                    # if a sample config provides a location for a bam file, assume
+                    # it is valid
+                    pass
+                else:
+                    files += expand(rules.call_validate.output, sample=samplename, lane=lane)
+    return files
+
+rule call_lane_merger:
+    """
+    take the aligned samples with the same name across all known
+    batches, and merge them together into a single "supersample".
+    """
+    # this rule should be updated together with call_trivial_merger
+    input:
+        bams=     (lambda wildcards: _get_unmerged_bams(wildcards.sample, fmt="bam")),
+        bais=     (lambda wildcards: _get_unmerged_bams(wildcards.sample, fmt="bai")),
+        all_valid=(lambda wildcards: _get_unmerged_bams(wildcards.sample, fmt="validated"))
+    output:
+        bam=      os.path.join(config["mergedir"], "merged_{sample}.bam"),
+        bai=      os.path.join(config["mergedir"], "merged_{sample}.bam.bai"),
+        manifest= os.path.join(config["mergedir"], "merged_{sample}.bam.merged.txt")
+    log:
+        "logs/call_lane_merger_{sample}.log"
+    singularity:
+        "docker://rieseberglab/analytics:2"
+    params:
+        sambamba="/home/sambamba_v0.6.6",
+        tmpdir=config['tmpdir']
+    threads: 4
+    shell:
+        """
+        exec >>{log} 2>&1;
+        set -x;
+        ./scripts/lane_merger.sh \
+            --tmpdir {params.tmpdir} \
+            --sambamba {params.sambamba} \
+            --samplename {wildcards.sample} \
+            {output.bam} \
+            {input.bams} {input.bais}
+        """
+
+rule call_trivial_merger:
+    """
+    for samples with only one lane output, we simply place a symlink in the merged folder
+    """
+    # this rule should be updated together with call_lane_merger
+    input:
+        bams=      (lambda wildcards: _get_unmerged_bams(wildcards.sample, fmt="bam")[:1]),
+        bais=      (lambda wildcards: _get_unmerged_bams(wildcards.sample, fmt="bai")[:1]),
+        validated=(lambda wildcards: _get_unmerged_bams(wildcards.sample, fmt="validated")[:1])
+    output:
+        bam=      os.path.join(config["mergedir"], "trivial_merged_{sample}.bam"),
+        bai=      os.path.join(config["mergedir"], "trivial_merged_{sample}.bam.bai"),
+        manifest= os.path.join(config["mergedir"], "trivial_merged_{sample}.bam.merged.txt")
+    log:
+        "logs/call_trivial_merger_{sample}.log"
+    params:
+        sambamba="/home/sambamba_v0.6.6",
+        tmpdir=config['tmpdir']
+    threads: 1
+    shell:
+        """
+        exec >>{log} 2>&1;
+        set -x;
+        ./scripts/lane_merger.sh \
+            --tmpdir {params.tmpdir} \
+            --sambamba {params.sambamba} \
+            --samplename {wildcards.sample} \
+            {output.bam} \
+            {input.bams} {input.bais}
+        """
+
+def _merged_maybe(samplename, fmt='bam'):
+    """
+    uses the output of the lane_merge call, except if there is only a
+    single bam for that samplename, in which case we used the trivially-aligned
+    output directly.
+
+    whether we take the shortcut depends on the sample name.
+
+    returns an array of dependencies, with members possibly containing wildcards
+    """
+    if fmt in ('validated',):
+        # validation is done on the individual bams, not on the merged output
+        return _get_unmerged_bams(samplename, fmt="validated")
+
+    lanenames = config['sample_slice'][samplename]
+
+    if len(lanenames) > 1:
+        return rules.call_lane_merger.output[fmt]
+    return rules.call_trivial_merger.output[fmt]
+
+rule call_vc:
+    """ single sample variant calling. {.bam,.bai} -> .g.vcf.idx"""
+    input:
+        reference=rules.call_align.input.reference,
+        sortedbed=config['sortedbed'],
+        bam=(lambda wildcards: _merged_maybe(wildcards.sample, fmt="bam")),
+        bai=(lambda wildcards: _merged_maybe(wildcards.sample, fmt="bai"))
+    params:
+        vc_bin="../bin/vc",
+    output:
+        gvcf     = os.path.join(config['gvcfdir'], "{sample}.bam.g.vcf.gz"),
+        gvcf_idx = os.path.join(config['gvcfdir'], "{sample}.bam.g.vcf.gz.tbi"),
+    resources:
+        mem_mb=lambda wildcards, attempt: (104 + 20 * attempt) * 1024
+    singularity:
+        Experiment.VC_SINGULARITY_IMAGE
+    log:
+        "logs/call_vc_{sample}.log"
+    threads: 32
+    shell:
+       """
+       exec >>{log} 2>&1;
+       set -x;
+       mkdir -p {config[gvcfdir]};
+       workdir=\\$(mktemp -d -p {config[tmpdir]} tmp.call_vc.{wildcards.sample}.XXXXXX);
+       mkdir -p \\${{workdir}}/vc_out/;
+       trap 'rm --one-file-system -r \\${{workdir}}' EXIT;
+       : disable core dumps -- which happen when java runs out of memory;
+       ulimit -c 0;
+       ulimit -Hc 0;
+
+       vc_threads=\\$(({threads} * 3))
+       {params.vc_bin} -n \\${{vc_threads}} -g \
+         -r file:{input.reference} \
+         -b file:{input.sortedbed} \
+         -i file:{input.bam} \
+         -nsegments \\$((32 * 5)) \
+         -minbp 0 \
+         -creds {config[credsfile]} \
+         -o file:\\${{workdir}}/vc_out \
+         -w \\${{workdir}} \
+         -gatk4;
+
+       OLD_GVCF=\\${{workdir}}/vc_out/\\$(basename {input.bam}).g.vcf;
+       NEW_GVCF=\\${{workdir}}/vc_out/\\$(basename {output.gvcf} .gz);
+       mv -v \\${{OLD_GVCF}} \\${{NEW_GVCF}}
+       \\${{CONDA_PREFIX}}/bin/bgzip \\${{NEW_GVCF}};
+       \\${{CONDA_PREFIX}}/bin/tabix -p vcf \\${{NEW_GVCF}}.gz;
+       mv -v \\${{NEW_GVCF}}.gz \\${{NEW_GVCF}}.gz.tbi \\$(dirname {output.gvcf})
+       """
+
+rule all_bam_future:
+     """ output a list of all bams, assuming they are valid -- without actually creating the bams"""
+     output:
+        expand(["bam-{sample_slice_uid}-list.future.txt"], sample_slice_uid=config['sample_slice_uid'])
+     run:
+        bams=_get_unmerged_bams(config['sample_slice'].keys(), fmt="bam")
+        # Just the full path of each bam
+        with open(output[0] + ".tmp", "w+") as tmpfile:
+            for sample_i, samplename in enumerate(config['sample_slice'].keys()):
+                tmpfile.write("%s\n" % (os.path.realpath(bams[sample_i]),))
+        os.rename(output[0] + ".tmp", output[0])
+        print("generated BAM listing: %s" % (output[0]))
+
+
+rule all_bam:
+    """ convert all input fastq files into BAM """
+    output:
+        expand(["bam-{sample_slice_uid}-list.txt", "allbam_fullpath_{sample_slice_uid}.txt" ], sample_slice_uid=config['sample_slice_uid'])
+    input:
+        bam      =_get_unmerged_bams(config['sample_slice'].keys(), fmt="bam"),
+        bai      =_get_unmerged_bams(config['sample_slice'].keys(), fmt="bai"),
+        validated=_get_unmerged_bams(config['sample_slice'].keys(), fmt="validated")
+    run:
+        with open(output[0] + ".tmp", "w+") as tmpfile:
+            for sample_i, samplename in enumerate(config['sample_slice'].keys()):
+                tmpfile.write("%s\tbam\t%s\n" % (samplename, input.bam[sample_i]))
+                tmpfile.write("%s\tbai\t%s\n" % (samplename, input.bai[sample_i]))
+        os.rename(output[0] + ".tmp", output[0])
+        print("generated BAM/BAI sample listing: %s" % (output[0]))
+
+        # Just the full path of each bam
+        with open(output[1] + ".tmp", "w+") as tmpfile:
+            for sample_i, samplename in enumerate(config['sample_slice'].keys()):
+                tmpfile.write("%s\n" % (os.path.realpath(input.bam[sample_i]),))
+        os.rename(output[1] + ".tmp", output[1])
+        print("generated BAM listing: %s" % (output[1]))
+
+def _generate_merged_list(samplenames, fmt='bam'):
+    """
+    fully expands all input merged files
+    """
+    if isinstance(samplenames, str):
+        samplenames = [samplenames]
+
+    files = []
+    for samplename in samplenames:
+        files += expand(_merged_maybe(samplename, fmt=fmt), sample=samplename)
+
+    return files
+
+rule write_merged_bam_list:
+    """ write list of files obtained in bam merge. without merging
+    them. gives a preview of files that will be generated
+
+    output:
+    SAMPLENAME_i UNMERGEDBAMi_0 MERGEDBAM_i
+    SAMPLENAME_i UNMERGEDBAMi_1 MERGEDBAM_i
+    ...
+    """
+    output:
+        os.path.join(config["mergedir"], "merged-bam-{sample_slice_uid}-list.map")
+    run:
+        outfile = output[0]
+        with open(outfile + ".tmp", "w+") as tmpfile:
+            for sample_i, samplename in enumerate(config['sample_slice'].keys()):
+                source_bams = _get_unmerged_bams([samplename], fmt='bam')
+                merged_bam  = _generate_merged_list([samplename], fmt='bam')[0]
+                for source_bam in source_bams:
+                    tmpfile.write("%s\t%s\t%s\n" % (samplename, source_bam, merged_bam))
+        os.rename(outfile + ".tmp", outfile)
+        print("generated merge manifest listing: %s" % (outfile,))
+
+rule all_merged:
+    """ merge all samples with the same name together """
+    output:
+        expand(["merged-{sample_slice_uid}-list.txt"], sample_slice_uid=config['sample_slice_uid'])
+    input:
+        bam=_generate_merged_list(config['sample_slice'].keys(), fmt='bam'),
+        bai=_generate_merged_list(config['sample_slice'].keys(), fmt='bai'),
+        validated=_generate_merged_list(config['sample_slice'].keys(), fmt='validated')
+    run:
+        with open(output[0] + ".tmp", "w+") as tmpfile:
+            for sample_i, samplename in enumerate(config['sample_slice'].keys()):
+                pass
+                source_bams = _get_unmerged_bams([samplename], fmt='bam')
+                merged_bam  = _generate_merged_list([samplename], fmt='bam')[0]
+                for source_bam in source_bams:
+                    tmpfile.write("%s\t%s\t%s\n" % (samplename, source_bam, merged_bam))
+        os.rename(output[0] + ".tmp", output[0])
+        print("generated merge manifest listing: %s" % (output[0]))
+
+
+def _sample_names_from_bam_stats_id(bam_stats_id):
+    sample_slice_uid, batch_size, batch_no = bam_stats_id.split("_", 2)
+    batch_size = int(batch_size, 10)
+    batch_no = int(batch_no, 10)
+    all_ids = _generate_bam_stats_ids(sample_slice_uid, batch_size)
+    sample_names = all_ids[bam_stats_id]
+
+    return sample_names
+
+def _merged_bams_by_bam_stats_id(bam_stats_id):
+    bams = []
+    for sample_name in _sample_names_from_bam_stats_id(bam_stats_id):
+        bams += expand(_merged_maybe(sample_name, fmt="bam"), sample=sample_name)
+    return bams
+
+rule write_bam_stats_map:
+    """writes the list of bam files to use as input for the given {bam_stats_id}:
+
+          bam_stats_id := {sample_slice_id}_{batch_size}_{batch_no}
+
+    output:
+
+        MERGEDBAM
+    """
+    output:
+        temp(os.path.join(config["mergedir"], "bam_stats_map_{bam_stats_id}.map"))
+    run:
+        bam_inputs = _merged_bams_by_bam_stats_id(wildcards.bam_stats_id)
+
+        with open(output[0] + ".tmp", "w+") as tmpfile:
+            for bam_input in bam_inputs:
+                tmpfile.write(bam_input + "\n")
+        os.rename(output[0] + ".tmp", output[0])
+
+def _get_bam_stats_input_bams(wildcards):
+    return _merged_bams_by_bam_stats_id(wildcards.bam_stats_id)
+
+rule call_bam_stats:
+    """
+    obtain statistics on merged bam files
+    """
+    input:
+        bam=U.log_exc(_get_bam_stats_input_bams, logger),
+        bam_map= rules.write_bam_stats_map.output
+    output:
+        os.path.join(config["mergedir"], "stats_done_{bam_stats_id}.flag")
+        # for each BAM in the group, there will be a BAM.stats
+    log:
+        "logs/call_bam_stats_{bam_stats_id}.log"
+    threads: 4
+    singularity:
+        "docker://rieseberglab/analytics:2"
+    resources:
+        mem_mb = lambda wildcards, attempt: (2 * attempt) * 1024
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+
+        CFGTMP={config[tmpdir]}
+        XTMP=\\${{SLURM_TMPDIR:-\\$CFGTMP}} # use local disk if on cluster
+        mkdir -p "\\$XTMP";
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.call_bam_stats.XXXXXX);
+        export LANG=C # stop perl from complaining about locales not being installed in container
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT;
+
+        function run_stats ()
+        {{
+            local TMPSTATS=\\$(mktemp -p "\\$1")
+            local start=\\$(date +%s)
+            ${{CONDA_PREFIX}}/bin/samtools stats -d "\\$2" > \\${{TMPSTATS}} && mv -f \\${{TMPSTATS}} "\\$3"
+            local end=\\$(date +%s)
+            echo "\\$3 took \\$((end - start))s"
+        }}
+        export -f run_stats
+        while read BAMFILE; do
+            if [[ ! -f \\${{BAMFILE}}.stats ]]; then
+                echo "run_stats \\${{workdir}} \\${{BAMFILE}} \\${{BAMFILE}}.stats"
+            fi
+        done < {input.bam_map} | \\${{CONDA_PREFIX}}/bin/parallel -j{threads}
+
+        # temp file output
+        touch {output}
+        """
+
+def _generate_bam_stats_ids(sample_slice_uid, batch_size):
+    cached = _generate_bam_stats_ids.cache.get((sample_slice_uid, batch_size))
+    if cached:
+        return cached
+    sample_slice = E.get_sample_slice_by_uid(sample_slice_uid)
+    sample_keys = [samplename for samplename in sample_slice.keys()]
+
+    bam_stats_ids = OrderedDict()
+
+    for ibatch, istart in enumerate(range(0, len(sample_slice), batch_size)):
+        batch = sample_keys[istart:istart+batch_size]
+        batch_id = "{}_{}_{}".format(sample_slice_uid, batch_size, ibatch)
+        bam_stats_ids[batch_id] = batch
+
+    _generate_bam_stats_ids.cache[(sample_slice_uid, batch_size)] = bam_stats_ids
+    return bam_stats_ids
+_generate_bam_stats_ids.cache = {}
+
+
+def _expand_bam_stats_ids(sample_slice_uid, template):
+    return expand(template,
+                  bam_stats_id=[bam_stats_id for bam_stats_id in
+                                _generate_bam_stats_ids(sample_slice_uid,
+                                                        config.get('stats_batch_size', 32)).keys()
+                  ]
+    )
+
+rule all_bam_stats:
+    """
+    run statistics on all merged bams.
+    """
+    input:
+        lambda wildcards: _expand_bam_stats_ids(Experiment.sample_slice_uid, rules.call_bam_stats.output)
+    run:
+        print("all_bam_stats done.")
+
+rule call_bases_mapped:
+    """For each sample in the cohort, print the number of bases mapped, sorted descending.
+
+    output format: (tab separated)
+
+       sample_name, bases_mapped, bam_path
+
+    """
+    input:
+        # the first dependency is to indirectly depend on all bam files
+        computed_stats = lambda wildcards: _expand_bam_stats_ids(wildcards.sample_slice_uid, rules.call_bam_stats.output),
+        stats_maps = lambda wildcards: _expand_bam_stats_ids(wildcards.sample_slice_uid, rules.write_bam_stats_map.output)
+    output:
+        bmapped_all  = os.path.join(config['mergedir'], "bases_mapped_{sample_slice_uid}_all.txt")
+    version: "v1"
+    run:
+        bams = []
+        for stats_map in input.stats_maps:
+            with open(stats_map, "r") as mapfd:
+                for bamline in mapfd:
+                    bams.append(bamline.split()[0])
+
+        sample_slice = E.get_sample_slice_by_uid(wildcards.sample_slice_uid)
+        all_sample_keys = [samplename for samplename in sample_slice.keys()]
+
+        # merged bam => samplename
+        reverse_map = {}
+        for samplename in all_sample_keys:
+            reverse_map[expand(_merged_maybe(samplename, fmt='bam'), sample=samplename)[0]] = samplename
+
+        sort_table = []
+        for merged_bam in bams:
+            stats_file = merged_bam + ".stats"
+            samplename = reverse_map[merged_bam]
+            with open(stats_file, "r") as statsfd:
+                for line in statsfd:
+                    #select that line:
+                    #SN      bases mapped (cigar):   15649805710     # more accurate
+                    toks = line.split()
+                    if toks[0] == "SN" and " ".join(toks).startswith("SN bases mapped (cigar):"):
+                        sort_table.append((int(toks[4], 10), samplename, merged_bam))
+                        break
+                else:
+                    raise Exception("Could not find bases mapped summary for sample: {}, {}, {}".format(samplename, stats_file))
+        sort_table.sort(reverse=True)
+
+        outfile = output.bmapped_all
+        with open(outfile + ".tmp", "w") as outfd:
+            for row in sort_table:
+                print_row = (row[1], str(row[0]), row[2])
+                outfd.write("\t".join(print_row) + "\n")
+        os.rename(outfile + ".tmp", outfile)
+
+rule all_bases_mapped:
+    """gets the sorted list of bases mapped for the experiment"""
+    input:
+        lambda wildcards: expand(rules.call_bases_mapped.output, sample_slice_uid=Experiment.sample_slice_uid)
+    run:
+        logger.run_info("bases mapped file generated: {}".format(input))
+
+rule grab_cytoplasm:
+    """extract the cytoplasmic genome out of the merged bam files"""
+    input:
+        bam=(lambda wildcards: _merged_maybe(wildcards.sample, fmt="bam")),
+        bai=(lambda wildcards: _merged_maybe(wildcards.sample, fmt="bai"))
+    output:
+        bam=os.path.join(config['cytoplasmdir'], "cytoplasm_{sample}.bam"),
+        bai=os.path.join(config['cytoplasmdir'], "cytoplasm_{sample}.bam.bai")
+    log:
+        "logs/grab_cytoplasm_{sample}.log"
+    params:
+        contigs=config['cytoplasm_contigs']
+    shell:
+        """
+        exec >>{log} 2>&1;
+        set -x;
+        workdir=$(mktemp -d -p "{config[tmpdir]}" "tmp.grab_cytoplasm.{wildcards.sample}.XXXXXX")
+
+        trap 'rm --one-file-system -r ${{workdir}}' EXIT;
+        outname=$(basename "{output.bam}");
+        tmpout=$workdir/$outname;
+
+        # do the work
+        samtools view -h -b "{input.bam}" {params.contigs} -o "$tmpout";
+        samtools index $tmpout;
+
+        # move to final position
+        ls -lh $workdir;
+        mv -v -- "$tmpout"     "{output.bam}";
+        mv -v -- "$tmpout".bai "{output.bai}";
+        """
+
+rule write_gendb_sample_map:
+    """
+    Writes a tab-delimited sample map suitable for use in GenomicsDBImport, based
+    on the subset of the samples to cover in the config file.
+
+    example list contents:
+
+    PET0391N	/mnt/gvcf/HI.4322.008.Index_1.PET0391N.bam.g.vcf
+    DBGBGBS_GB334	/mnt/gvcf/DBGBGBS_GB334.bam.g.vcf
+    """
+    input:
+        nada=_no_inputs,
+    version:
+        "1"
+    output:
+        # use the same sample list for any contig
+        temp(os.path.join(config['jointcalldir'], "sample_map_{call_uid}.txt"))
+    run:
+        sample_slice = Experiment.vcf_sample_slice(wildcards.call_uid)
+        gvcf_template = rules.call_vc.output.gvcf
+        with open(output[0] + ".tmp", "w+") as tmpfile:
+            for samplename in sample_slice.keys():
+                gvcf_path = expand(gvcf_template, sample=samplename)[0]
+                tmpfile.write(samplename + "\t" + gvcf_path + "\n")
+        os.rename(output[0] + ".tmp", output[0])
+
+rule write_intervals_list:
+    """
+    Writes a file listing the names of gatk intervals covered in a range between
+    intervals A and intervals B, inclusively.
+
+    interval_a=HanXRQChr0-000000001-100000000  interval_b=HanXRQChr0-200000001-300000000
+
+    example list contents (2 columns: gatk	wildcard):
+
+    HanXRQChr0:000000001-100000000	HanXRQChr0-000000001-100000000
+    ...
+    HanXRQChr0:200000001-300000000	HanXRQChr0-200000001-300000000
+    """
+    input:
+        nada=_no_inputs,
+    version:
+        "1"
+    output:
+        temp(os.path.join(config['jointcalldir'], "intervals_list_{interval_a,[^_.]+}_{interval_b,[^_.]+}.txt"))
+    run:
+        contig_slice = config['contig_slice']
+        interval_a = Contig.from_wildcard(wildcards.interval_a)
+        interval_b = Contig.from_wildcard(wildcards.interval_b)
+
+        with open(output[0] + ".tmp", "w+") as tmpfile:
+            for contig_i, contig in Contig.contig_window(contig_slice, interval_a, interval_b):
+                tmpfile.write(contig.to_gatk_interval() + "\t" + contig.to_wildcard() + "\n")
+        os.rename(output[0] + ".tmp", output[0])
+
+def _gvcf_inputs_by_uid(call_uid, fmt="gvcf"):
+    """ get the list of gvcfs for single-samples based on sample_slice_uid """
+
+    sample_slice = Experiment.vcf_sample_slice(call_uid)
+    gvcf_template = rules.call_vc.output[fmt]
+
+    x = [ expand(gvcf_template, sample=samplename)[0] for samplename in sample_slice.keys() ]
+    return x
+
+rule call_gendb:
+    """take all single-sample gvcfs, and convert them into genomicsdb format"""
+    input:
+        sample_map = rules.write_gendb_sample_map.output,
+        gvcf       = U.log_exc(lambda wildcards: _gvcf_inputs_by_uid(wildcards.call_uid), logger),
+        gvcf_idx   = U.log_exc(lambda wildcards: _gvcf_inputs_by_uid(wildcards.call_uid, fmt="gvcf_idx"), logger),
+    output:
+        gendb = os.path.join(config['gendbdir'], "gendb_{call_uid,[^_.]+}_{interval,[^_.]+}.db")
+    params:
+        ram="20G" # additional ram on top of that will be needed for tiledb
+    resources:
+        mem_mb=24*1024
+    log:
+        "logs/call_gendb_{call_uid}_{interval}.log"
+    singularity:
+        "docker://broadinstitute/gatk:4.0.1.2"
+    shell:
+        """
+        exec >>{log} 2>&1;
+        set -x;
+        echo call_gendb {wildcards}
+        echo Using sampleMap {input.sample_map};
+        cat {input.sample_map};
+
+        CFGTMP={config[tmpdir]}
+        XTMP=\\${{SLURM_TMPDIR:-\\$CFGTMP}} # use local disk if on cluster
+        mkdir -p "\\$XTMP";
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.gendbimport.XXXXXX);
+
+        interval={wildcards.interval}
+        gatk_interval=\\$(IFS=-; tmp=( \\$interval ); echo \\${{tmp[0]}}:\\${{tmp[1]}}-\\${{tmp[2]}}; ) # replace first - with :
+
+        if [[ -d "{output.gendb}" ]]; then rm --one-file-system -r "{output.gendb}"; fi;
+        trap 'rm --one-file-system -r -- \\${{workdir}}' EXIT;
+
+        HOME=\\${{workdir}} /gatk/gatk GenomicsDBImport \
+          --java-options '-Xmx{params.ram} -DGATK_STACKTRACE_ON_USER_EXCEPTION=true' \
+	  --genomicsdb-workspace-path \\${{workdir}}/tmp.db \
+          -L \\${{gatk_interval}} \
+	  --batch-size 200 \
+	  --validate-sample-name-map true \
+          --sample-name-map {input.sample_map};
+
+        # move to final location
+        mv \\${{workdir}}/tmp.db {output.gendb}
+        """
+
+rule call_vcf:
+    """
+    take the g.vcf files in genomicsdb format and output a vcf file.
+    """
+    input:
+        gendb = rules.call_gendb.output.gendb,
+        reference = config['reference']
+    output:
+        vcf     = os.path.join(config['jointcalldir'], "vcf_{call_uid,[^_.]+}_{interval,[^_.]+}.vcf.gz"),
+        vcf_idx = os.path.join(config['jointcalldir'], "vcf_{call_uid,[^_.]+}_{interval,[^_.]+}.vcf.gz.tbi")
+    params:
+        gvcf_args = Experiment.GENOTYPE_GVCFS_ARGS
+    resources:
+        mem_mb = lambda wildcards, attempt: (40 + 20 * attempt) * 1024
+    log:
+        "logs/call_vcf_{call_uid}_{interval}.log"
+    singularity:
+        Experiment.VCF_SINGULARITY_IMAGE
+    shell:
+        """
+        exec >>{log} 2>&1;
+        set -x;
+
+        CFGTMP={config[tmpdir]}
+        XTMP=\\${{SLURM_TMPDIR:-\\$CFGTMP}} # use local disk if on cluster
+        mkdir -p "\\$XTMP"
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.vcf.XXXXXX);
+
+        echo call_vcf {wildcards}
+        outname=\\$(basename {output.vcf});
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT; \
+        echo copying gendb to tmp
+        cp -r {input.gendb} \\${{workdir}}/
+
+        interval={wildcards.interval}
+        gatk_interval=\\$(IFS=-; tmp=( \\$interval ); echo \\${{tmp[0]}}:\\${{tmp[1]}}-\\${{tmp[2]}}; ) # replace first - with :
+        gendb=\\${{workdir}}/\\$(basename {input.gendb})
+
+        HOME=\\${{workdir}} /gatk/gatk GenotypeGVCFs \
+            -R {input.reference} \
+            -V gendb://\\${{gendb}} \
+            -L \\${{gatk_interval}} \
+            -O \\${{workdir}}/\\${{outname}} \
+            {params.gvcf_args} \
+            --seconds-between-progress-updates 5;
+        echo files produced:;
+        ls \\${{workdir}};
+        mv -v \\${{workdir}}/\\${{outname}}     {output.vcf};
+        mv -v \\${{workdir}}/\\${{outname}}.tbi {output.vcf_idx};
+    """
+
+rule call_vcf_batch:
+    """
+    generates vcf files for a batch of contigs. For each contig,
+      -1 imports the data into a genomicsDB
+      -2 produces VCFs for the input data using genotypegvcfs
+
+    the output is a tarball with vcf files (.vcf.gz + .vcf.gz.tbi),
+    for each contig
+    """
+    input:
+        sample_map     = rules.write_gendb_sample_map.output,
+        intervals_list = rules.write_intervals_list.output,
+        gvcf           = U.log_exc(lambda wildcards: _gvcf_inputs_by_uid(wildcards.call_uid), logger),
+        gvcf_idx       = U.log_exc(lambda wildcards: _gvcf_inputs_by_uid(wildcards.call_uid, fmt="gvcf_idx"), logger),
+        reference = config['reference']
+    output:
+        vcf_tar = os.path.join(config['jointcalldir'], "vcf_{call_uid}_{interval_a,[^_.]+}_{interval_b,[^_.]+}.tar"),
+    log:
+        "logs/call_vcf_batch_{call_uid}_{interval_a}_{interval_b}.log"
+    singularity:
+        rules.call_vcf.singularity_img
+    resources:
+        mem_mb = lambda wildcards, attempt: (10 + 20 * attempt) * 1024
+    params:
+        gvcf_args = rules.call_vcf.params.gvcf_args
+    shell:
+        """
+        exec >>{log} 2>&1;
+        set -x;
+        set -o pipefail;
+        ulimit -c 0;
+        ulimit -Hc 0;
+
+        echo call_vcf_batch {wildcards}
+        echo Processing intervals {input.intervals_list};
+        cat {input.intervals_list};
+
+        CFGTMP={config[tmpdir]}
+        XTMP=\\${{SLURM_TMPDIR:-\\$CFGTMP}} # use local disk if on cluster
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.vcf.XXXXXX);
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT; \
+
+        mkdir -p \\${{XTMP}}/gatk
+
+        # keep 2G for buffer and subprocesses
+        JAVA_GENGVCFS_MB=\\$(({resources.mem_mb} - 2048))
+        JAVA_GENDB_MB=\\$((20*1024))
+
+        function do_gendb ()
+        {{
+            local intervaldb="\\$1"
+            local sample_map="\\$2"
+            local gatk_interval="\\$3"
+            HOME=\\$(dirname \\${{intervaldb}}) /gatk/gatk GenomicsDBImport \
+              --java-options "-Xmx\\${{JAVA_GENDB_MB}}m -DGATK_STACKTRACE_ON_USER_EXCEPTION=true" \
+	      --genomicsdb-workspace-path \\${{intervaldb}} \
+              -L "\\${{gatk_interval}}" \
+	      --batch-size 200 \
+	      --validate-sample-name-map true \
+              --TMP_DIR \\${{XTMP}}/gatk \
+              --sample-name-map \\${{sample_map}};
+        }}
+
+        function do_gengvcfs ()
+        {{
+            local intervalvcf="\\$1"
+            local reference="\\$2"
+            local intervaldb="\\$3"
+            local gatk_interval="\\$4"
+            HOME=\\${{workdir}} /gatk/gatk GenotypeGVCFs \
+                --java-options "-Xmx\\${{JAVA_GENGVCFS_MB}}m -DGATK_STACKTRACE_ON_USER_EXCEPTION=true" \
+                -R \\${{reference}} \
+ 	        -V gendb://\\${{intervaldb}} \
+ 	        -L \\${{gatk_interval}} \
+ 	        -O \\${{intervalvcf}} \
+                --TMP_DIR \\${{XTMP}}/gatk \
+ 	        --seconds-between-progress-updates 5 \
+                {params.gvcf_args} \
+                --verbosity INFO;
+        }}
+
+
+        mkdir -p \\${{workdir}}/logs/
+        #
+        # for each interval import data into genomicsdb and produce a vcf
+        #
+        TOTAL=\\$(wc -l {input.intervals_list})
+        CURLINE=0
+        while read gatk_interval wildcard_interval REST; do
+            let CURLINE=CURLINE+1
+            : ITERATION \\$CURLINE OF \\$TOTAL
+            logfile="log_{wildcards.call_uid}_\\${{wildcard_interval}}.log"
+            intervaldb=gendb_"{wildcards.call_uid}_\\${{wildcard_interval}}".db;
+            intervalvcf="vcf_{wildcards.call_uid}_\\${{wildcard_interval}}".vcf.gz;
+            (
+                do_gendb    "\\${{workdir}}/\\${{intervaldb}}" "{input.sample_map}" "\\${{gatk_interval}}"
+                do_gengvcfs "\\${{workdir}}/\\${{intervalvcf}}" "{input.reference}" "\\${{workdir}}/\\${{intervaldb}}" "\\${{gatk_interval}}"
+            ) |& tee "\\${{workdir}}/logs/\\${{logfile}}"
+        done < {input.intervals_list}
+        ( cd \\${{workdir}} && tar -cvf out.tar *.vcf.gz *.vcf.gz.tbi logs/; )
+        mv -v \\${{workdir}}/out.tar {output.vcf_tar};
+    """
+
+def _chromosome_vcf_names(templates, **expandkey):
+    """expands each template's {chrom} placeholder with
+        the chromosome's name for each chromosome of the contigrange
+
+      templates is a dictionary such as {"myfiles": ["foo_{chrom}.txt", "bar_{chrom}.txt"]}
+    """
+    all_contigs = config['contig_slice']
+    all_names = {}
+    for contig in config['contig_slice']:
+        all_names[contig.chrom] = contig.length
+    chrom_intervals = [Contig(name, 1, length, length).chrom for name, length in all_names.items()]
+    return {k: expand(v, chrom=chrom_intervals, **expandkey) for k,v in templates.items()}
+
+
+def _all_individual_vcfs(fmt="vcf"):
+    extra = ""
+    if fmt == "vcf_idx":
+        extra = ".tbi"
+    return expand([os.path.join(config['jointcalldir'], "vcf_{call_uid}_{interval}.vcf.gz"  + extra)],
+                  call_uid=Experiment.vcf_call_uid,
+                  interval=[x.to_wildcard() for x in config['contig_slice']])
+
+def _all_individual_gendb(wildcards):
+    return expand(os.path.join(config['gendbdir'], "gendb_{sampleset}_{interval}.db"),
+                  sampleset=config['sample_slice_uid'],
+                  interval=config['contig_slice']) # for each selected inteval
+
+rule all_vcf:
+    """ take all input sample g.vcfs for the same contig (i.e. bp interval) and output a variant called .vcf file """
+    #FIXME -- write summary message at the end
+    input:
+        vcf     = lambda wildcards: _all_individual_vcfs(fmt="vcf"),
+        vcf_idx = lambda wildcards: _all_individual_vcfs(fmt="vcf_idx")
+
+rule all_gendb:
+    """ For each selected interval:
+           combine each .g.vcf from the selected sample set into a genomicsdb
+    """
+    input:
+        all_files = _all_individual_gendb
+
+rule all_gvcf:
+    """For each selected sample:
+           produce .g.vcf.gz. and .g.vcf.gz.tbi
+    """
+    input:
+        gvcf     = lambda wildcards: _gvcf_inputs_by_uid(Experiment.vcf_call_uid),
+        gvcf_idx = lambda wildcards: _gvcf_inputs_by_uid(Experiment.vcf_call_uid, fmt="gvcf_idx")
+    run:
+        logger.run_info("Completed GVCFs for call:%s samples:%s" % (Experiment.vcf_call_uid, Experiment.sample_slice_uid))
+
+def _all_vcf_batches_by_bp(wildcards):
+
+    """Produce a list of vcf_batch inputs by splitting all contigs into interval ranges
+       which are roughly the same size, counted in number of basepairs.
+
+       This produces a list of input files where {interval_a} and {interval_b} are replaced
+       with limits of the interval ranges formed.
+    """
+    template = os.path.join(config['jointcalldir'], "vcf_{call_uid}_{interval_a}_{interval_b}.tar")
+
+    inputs = [ expand(template,
+                      call_uid=Experiment.vcf_call_uid,
+                      interval_a=ival_a.to_wildcard(),
+                      interval_b=ival_b.to_wildcard())[0] for (ival_a, ival_b) in _all_vcf_batch_intervals(Experiment.contig_list_uid) ]
+    return inputs
+
+rule all_vcf_batch:
+    input:
+        vcf_tar = _all_vcf_batches_by_bp
+
+def _vcf_inputs_by_chrom_prefix(vcf_call_uid, contig_list_uid, chrom_prefix):
+    """gets the list of raw vcf inputs that have any overlap for chromosomes matching
+       chrom_prefix
+    """
+    logger.run_info("_vcf_inputs_by_chrom_prefix vcf_call_uid=%s contig_list_uid=%s chrom_prefix=%s" % (vcf_call_uid, contig_list_uid, chrom_prefix))
+
+    # hack
+    if config.get("notar", False):
+        vcf_template     = os.path.join(config['jointcalldir'], "vcf_{call_uid}_{interval}.vcf.gz")
+        vcf_idx_template = os.path.join(config['jointcalldir'], "vcf_{call_uid}_{interval}.vcf.gz.tbi")
+        contigs = _contigs_by_chrom_prefix(contig_list_uid, chrom_prefix)
+        return expand([vcf_template, vcf_idx_template],
+                      call_uid=vcf_call_uid,
+                      interval=[contig.to_wildcard() for contig in contigs])
+    else:
+        # use the batch tarballs
+        template = os.path.join(config['jointcalldir'], "vcf_{call_uid}_{interval_a}_{interval_b}.tar")
+        intervals = _intervals_by_chrom_prefix(contig_list_uid, chrom_prefix)
+        return [expand(template,
+                       call_uid=vcf_call_uid,
+                       interval_a=ival_a.to_wildcard(),
+                       interval_b=ival_b.to_wildcard())[0] for (ival_a, ival_b) in intervals]
+
+def _expand_chrom_prefix_by_id(vcf_call_uid, contig_list_uid, template, _exclude_prefixes=None, **extra):
+    """expand {chrom_prefix} to be generated based on the parameters"""
+
+    # filter out chrom_prefixes not covered in contigrange
+    non_empty_prefixes = _get_valid_chrom_prefixes(Experiment.contig_list_uid)
+
+    # filter out chrom_prefixes which are specified by _exclude_prefixes
+    exclude_map = {x: True for x in _exclude_prefixes} if _exclude_prefixes else {}
+
+    if exclude_map:
+        included = [ pfx for pfx in non_empty_prefixes if pfx not in exclude_map ]
+        if len(included) == len(non_empty_prefixes):
+            logger.warning("Chromosome prefixes %s would be omitted from filtering, but they are not present in the raw input." %
+                           (exclude_map.keys()))
+    else:
+        # no change
+        included = non_empty_prefixes
+
+    # FIXME patch snakemake with safe expand() -- a version that removes placeholder regexes
+    template_safe, template_subs = re.subn(r'{([^{},]+)(,[^}]+)?}', lambda m: "{" + m.group(1) + "}", template)
+    return expand(template_safe,
+                  call_uid=vcf_call_uid,
+                  contig_list_uid=contig_list_uid,
+                  chrom_prefix=included,
+                  **extra
+    )
+
+rule write_vcf_chrom_map:
+    """
+    writes a plain file:
+
+    one chromosome per line:
+       chrom [contigs_for_chrom]+
+    """
+    output:
+        temp(os.path.join(config['jointcalldir'], "vcf_chrom_map_{call_uid}_{contig_list_uid}.txt"))
+    run:
+        per_chrom = _contigs_by_chrom_map(wildcards.contig_list_uid)
+
+        with open(output[0] + ".tmp", "w+") as tmpfile:
+            for chrom_name, contigs in per_chrom.items():
+                tmpfile.write("\t".join([chrom_name] + [c.to_wildcard() for c in contigs]) + "\n")
+        os.rename(output[0] + ".tmp", output[0])
+
+rule write_vcf_inputs_by_chrom_prefix_list:
+    """ this is a rule whose sole purpose is to produce a file listing
+        that can be ingested by call_vcf_chrom.  the large number of
+        contigs to gather breaks OS command line limits.  """
+    output:
+        os.path.join(config['jointcalldir'], "vcf_inputs_by_chrom_prefix_list_{call_uid}_{contig_list_uid}_{chrom_prefix}.txt"),
+    run:
+        inputs = _vcf_inputs_by_chrom_prefix(wildcards.call_uid, wildcards.contig_list_uid, wildcards.chrom_prefix)
+        with open(output[0] + ".tmp", "w+") as tmpfile:
+            for infile in inputs:
+                tmpfile.write(infile + "\n")
+        os.rename(output[0] + ".tmp", output[0])
+
+rule call_vcf_chrom:
+    """merge raw per-contig VCF files into a whole-chromosome VCF"""
+    input:
+        data = U.log_exc(lambda wildcards: [] if config.get("skip_vcf_chrom", False) else _vcf_inputs_by_chrom_prefix(wildcards.call_uid,
+                                                                       wildcards.contig_list_uid,
+                                                                       wildcards.chrom_prefix),
+                         logger),
+        chrom_map = ancient(rules.write_vcf_chrom_map.output),
+        vcf_input_map = ancient(rules.write_vcf_inputs_by_chrom_prefix_list.output),
+        reference=config['reference']
+    output:
+        chrom_vcf     = os.path.join(config['jointcalldir'], "chrom_{call_uid}_{contig_list_uid}", "raw_{chrom_prefix}.vcf.gz"),
+        chrom_vcf_idx = os.path.join(config['jointcalldir'], "chrom_{call_uid}_{contig_list_uid}", "raw_{chrom_prefix}.vcf.gz.tbi")
+    log:
+        "logs/call_vcf_chrom_{chrom_prefix}_{call_uid}_{contig_list_uid}.log"
+    singularity:
+        Experiment.VCF_SINGULARITY_IMAGE
+    threads: 2
+    resources:
+        mem_mb = lambda wildcards, attempt: (14 + 10 * attempt) * 1024
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+
+        # we avoid localdisk because it is of limited capacity, and when jobs get
+        # co-scheduled, we run out. needs ~2TB collectively.
+        XTMP={config[tmpdir]}
+        export LANG=C # stop perl from complaining about locales not being installed in container
+
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.call_vcf_chrom.XXXXXX);
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT; \
+
+        call_uid={wildcards.call_uid}
+        chrom_prefix={wildcards.chrom_prefix}
+        contig_list_uid={wildcards.contig_list_uid}
+        destdir=\\${{workdir}}/output/
+
+        mkdir -p \\$workdir/inputs \\$workdir/gatk \\$destdir/logs
+
+        (
+            # copy inputs to workdir
+            # the inputs can be one of two things:
+            #   - tar of vcf.gz => unpack tar into workdir
+            #   - vcf.gz(.tbi)  => symlink into workdir
+            declare -a allinput
+            set +x;
+            allinput=( \\$(cat {input.vcf_input_map}) )
+            set -x;
+            time for ((i=0; i<\\${{#allinput[@]}}; i++)); do
+                infile=\\${{allinput[i]}}
+                case "\\$infile" in
+                   *.tar)
+                       echo "set -x; tar -C \\$workdir/inputs/ -xf \\${{allinput[i]}}";
+                       ;;
+                   *.vcf.gz|*.vcf.gz.tbi)
+                       echo "ln -s \\$(readlink -f "\\$infile") \\$workdir/inputs/\\$(basename "\\$infile")";
+                       ;;
+                esac
+            done | \\${{CONDA_PREFIX}}/bin/parallel -j{threads}
+        )
+
+
+        declare -a chrom_contigs
+
+        # prefix for per-interval vcf input files
+        vcf_prefix="vcf_\\${{call_uid}}_"
+
+        chrom_args=\\${{workdir}}/chrom_args_\\${{chrom_prefix}}.txt
+        (
+            echo "-R {input.reference}"
+            echo "--TMP_DIR \\${{workdir}}/gatk"
+        ) > \\${{chrom_args}}
+
+        while read -a chrom_contigs; do
+            chrom_name=\\${{chrom_contigs[0]}}
+            for ((i=1; i < \\${{#chrom_contigs[@]}}; i++)); do
+                echo "-I \\$workdir/inputs/\\${{vcf_prefix}}\\${{chrom_contigs[i]}}.vcf.gz"
+            done >> \\${{chrom_args}}
+        done < <(grep "^\\${{chrom_prefix}}" {input.chrom_map})
+
+
+        function gather_chromosome () {{
+            # workdir, arguments, outfile, logfile
+            export HOME="\\$1"
+            (
+                set -x
+                /gatk/gatk GatherVcfs --arguments_file "\\$2" -O "\\$3"
+                \\${{CONDA_PREFIX}}/bin/tabix -p vcf "\\$3"
+            ) |& tee "\\$4"
+        }}
+        export -f gather_chromosome
+
+        outname=\\$(basename {output.chrom_vcf})
+        logfile="\\$outname".log
+        gather_chromosome "\\$workdir" "\\${{chrom_args}}" "\\$destdir/\\$outname" "\\$destdir/logs/\\$logfile"
+
+        # quick move to final location
+        finaldir=\\$(dirname {output.chrom_vcf})
+        mkdir -p "\\$finaldir"  "\\$finaldir"/logs
+        mv -v "\\$destdir/\\$outname"{{,.tbi}}  "\\$finaldir/"
+        mv -v "\\$destdir/logs/\\$logfile" "\\$finaldir/logs/"
+        """
+
+rule call_gather_raw_chrom:
+    """take all raw per-chromosomes and gather them in a single gigantic vcf.
+
+       NOTE: Only do this if your dataset is of manageable size. (<100 samples)
+             It might be difficult to move large files around otherwise.
+    """
+    input:
+        chrom_vcf     = lambda wildcards: expand(rules.call_vcf_chrom.output.chrom_vcf,
+                                                 chrom_prefix=_get_valid_chrom_prefixes(wildcards.contig_list_uid)),
+        chrom_vcf_idx = lambda wildcards: expand(rules.call_vcf_chrom.output.chrom_vcf_idx,
+                                                 chrom_prefix=_get_valid_chrom_prefixes(wildcards.contig_list_uid)),
+        reference = config['reference']
+    output:
+        chrom_vcf     = os.path.join(config['jointcalldir'], "chrom_{call_uid}_{contig_list_uid}", "raw_gathered.vcf.gz"),
+        chrom_vcf_idx = os.path.join(config['jointcalldir'], "chrom_{call_uid}_{contig_list_uid}", "raw_gathered.vcf.gz.tbi")
+    log:
+        os.path.join(config['jointcalldir'], "chrom_{call_uid}_{contig_list_uid}", "gold_set.vcf.gz.log")
+    resources:
+        mem_mb = lambda wildcards, attempt: (3 * attempt) * 1024
+    singularity:
+        Experiment.VCF_SINGULARITY_IMAGE
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+        CFGTMP={config[tmpdir]}
+        XTMP=\\${{SLURM_TMPDIR:-\\$CFGTMP}} # use local disk if on cluster
+        mkdir -p "\\$XTMP";
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.{rule}.XXXXXX);
+        export LANG=C # stop perl from complaining about locales not being installed in container
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT; \
+
+        mkdir -p \\${{workdir}}/gatk \\${{workdir}}/output
+        base=\\$(basename {output.chrom_vcf})
+        argsfile=\\${{workdir}}/args.txt
+
+        set +x
+          inputs=( {input.chrom_vcf} )
+          echo "-R {input.reference}" >> \\$argsfile
+          for i in "\\${{argsfile[@]}}"; do
+              echo "-I \\$i" >> \\$argsfile
+          done
+        set -x
+
+        export HOME="\\${{workdir}}"
+        JAVA_MB=\\$(({resources.mem_mb} - 512))
+        /gatk/gatk GatherVcfs \
+            --java-options "-Xmx\\${{JAVA_MB}}m -DGATK_STACKTRACE_ON_USER_EXCEPTION=true" \
+            --TMP_DIR=\\${{workdir}}/gatk \
+            --arguments_file "\\$argsfile" \
+            -O "\\${{workdir}}/\\$base"
+        \\${{CONDA_PREFIX}}/bin/tabix -p vcf "\\${{workdir}}/\\$base"
+
+        mv -vf \\${{workdir}}/output/* \\$(dirname {output.chrom_vcf})/
+        """
+
+rule call_vcf_chrom_excess_het:
+    """ Filter sites with excess Het.
+
+        ExcessHet is a phred-scaled p-value. We want a cutoff of anything more extreme
+        than a z-score of -4.5 which is a p-value of 3.4e-06, which phred-scaled is 54.69
+
+        excess_het_threshold = 54.69
+    """
+    input:
+        chrom_vcf     = rules.call_vcf_chrom.output.chrom_vcf,
+        chrom_vcf_idx = rules.call_vcf_chrom.output.chrom_vcf_idx,
+    output:
+        chrom_vcf     = os.path.join(config['jointcalldir'], "chrom_{call_uid}_{contig_list_uid}", "excess_het_{chrom_prefix}.vcf.gz"),
+        chrom_vcf_idx = os.path.join(config['jointcalldir'], "chrom_{call_uid}_{contig_list_uid}", "excess_het_{chrom_prefix}.vcf.gz.tbi")
+    log:
+        "logs/call_vcf_chrom_excess_het_{call_uid}_{contig_list_uid}_{chrom_prefix}.log"
+    resources:
+        mem_mb = lambda wildcards, attempt: (4 * attempt) * 1024
+    params:
+        excess_het_threshold = "54.69"
+    singularity:
+        Experiment.VCF_SINGULARITY_IMAGE
+    threads: 1
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+
+        # we avoid localdisk because it is of limited capacity, and when jobs get
+        # co-scheduled, we run out. needs ~2TB collectively.
+        XTMP={config[tmpdir]}
+        export LANG=C # stop perl from complaining about locales not being installed in container
+
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.{rule}.XXXXXX);
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT; \
+
+        call_uid={wildcards.call_uid}
+        chrom_prefix={wildcards.chrom_prefix}
+        contig_list_uid={wildcards.contig_list_uid}
+        destdir=\\${{workdir}}/output/
+        mkdir -p \\${{workdir}}/gatk \\${{workdir}}/output
+        base=\\$(basename {output.chrom_vcf})
+        export HOME="\\${{workdir}}"
+
+        JAVA_MB=\\$(({resources.mem_mb} - 1024))
+        /gatk/gatk VariantFiltration \
+            --java-options "-Xmx\\${{JAVA_MB}}m -DGATK_STACKTRACE_ON_USER_EXCEPTION=true" \
+            --TMP_DIR=\\${{workdir}}/gatk \
+            --filter-expression "ExcessHet > {params.excess_het_threshold}" \
+            --filter-name ExcessHet \
+            -V {input.chrom_vcf} \
+            -O "\\${{workdir}}/output/\\${{base}}"
+        mv -vf \\${{workdir}}/output/* \\$(dirname {output.chrom_vcf})/
+        """
+
+rule call_vcf_chrom_sites_only:
+    """transform raw VCF into sites-only VCF.
+
+       Writes out a VCF that contains all the site-level information
+    for all records in the input VCF and no per-sample information.
+    """
+    input:
+        chrom_vcf     = rules.call_vcf_chrom_excess_het.output.chrom_vcf,
+        chrom_vcf_idx = rules.call_vcf_chrom_excess_het.output.chrom_vcf_idx
+    output:
+        chrom_vcf     = os.path.join(config['jointcalldir'], "chrom_{call_uid}_{contig_list_uid}", "sites_only_{chrom_prefix}.vcf.gz"),
+        chrom_vcf_idx = os.path.join(config['jointcalldir'], "chrom_{call_uid}_{contig_list_uid}", "sites_only_{chrom_prefix}.vcf.gz.tbi")
+    log:
+        "logs/call_vcf_chrom_sites_only_{call_uid}_{contig_list_uid}_{chrom_prefix}.log"
+    resources:
+        mem_mb = lambda wildcards, attempt: (4 * attempt) * 1024
+    singularity:
+        Experiment.VCF_SINGULARITY_IMAGE
+    threads: 1
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+
+        # we avoid localdisk because it is of limited capacity, and when jobs get
+        # co-scheduled, we run out. needs ~2TB collectively.
+        XTMP={config[tmpdir]}
+        export LANG=C # stop perl from complaining about locales not being installed in container
+
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.{rule}.XXXXXX);
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT; \
+
+        call_uid={wildcards.call_uid}
+        chrom_prefix={wildcards.chrom_prefix}
+        contig_list_uid={wildcards.contig_list_uid}
+        destdir=\\${{workdir}}/output/
+        mkdir -p \\${{workdir}}/gatk \\${{workdir}}/output
+        base=\\$(basename {output.chrom_vcf})
+        export HOME="\\${{workdir}}"
+
+        JAVA_MB=\\$(({resources.mem_mb} - 1024))
+        /gatk/gatk MakeSitesOnlyVcf \
+            --java-options "-Xmx\\${{JAVA_MB}}m -DGATK_STACKTRACE_ON_USER_EXCEPTION=true" \
+            --TMP_DIR=\\${{workdir}}/gatk \
+            --INPUT={input.chrom_vcf} \
+            --OUTPUT="\\${{workdir}}/output/\\${{base}}"
+        mv -vf \\${{workdir}}/output/* \\$(dirname {output.chrom_vcf})/
+        """
+
+rule write_goldset_params:
+    """write information about the parameters used in a goldset"""
+    input:
+        nada=_no_inputs,
+    output:
+        paramsfile=os.path.join(config['goldset_dir'], "goldset_{goldset_uid}", "goldset.params.txt")
+    version: "v1"
+    log:
+        os.path.join(config['goldset_dir'], "goldset_{goldset_uid}", "goldset.params.txt.log")
+    run:
+        import sys; sys.stderr = open(str(log), "w", encoding="utf-8")
+
+        gold_params = E.get_gold_params_by_uid(wildcards.goldset_uid)
+        sample_slice = E.get_sample_slice_by_uid(gold_params['sample_slice_uid'])
+        filter_text = gold_params["goldset_filter_text"]
+
+        output_file = output.paramsfile
+        with open(output_file + ".tmp", "w+") as tmpfile:
+            for samplename in sample_slice.keys():
+                tmpfile.write("#SM\t{}\n".format(samplename))
+            tmpfile.write("#MAX_AN\t{}\n".format(str(2*len(sample_slice))))
+
+            for line in filter_text.splitlines():
+                if not line: continue
+                tmpfile.write("#FILTER\t{}\n".format(line))
+
+        os.rename(output_file + ".tmp", output_file)
+        logger.run_info("generated %s" % (output_file,))
+
+def _get_goldset_vcf_inputs(wildcards):
+    goldset_uid = wildcards.goldset_uid
+    gold_params = E.get_gold_params_by_uid(goldset_uid)
+    return _expand_chrom_prefix_by_id(gold_params['vcf_call_uid'], gold_params['contig_list_uid'], rules.call_vcf_chrom_sites_only.output.chrom_vcf)
+
+rule call_vcf_goldset:
+    """
+    Filter VCF files so that they are usable as a training set for VariantRecalibrator
+    """
+    input:
+        chrom_vcf      = _get_goldset_vcf_inputs,
+        goldset_params = rules.write_goldset_params.output,
+        reference = config['reference']
+    output:
+        snps       = os.path.join(config['goldset_dir'], "goldset_{goldset_uid}", "goldset.snps.vcf.gz"),
+        snps_idx   = os.path.join(config['goldset_dir'], "goldset_{goldset_uid}", "goldset.snps.vcf.gz.tbi"),
+        indels     = os.path.join(config['goldset_dir'], "goldset_{goldset_uid}", "goldset.indels.vcf.gz"),
+        indels_idx = os.path.join(config['goldset_dir'], "goldset_{goldset_uid}", "goldset.indels.vcf.gz.tbi")
+    log:
+        os.path.join(config['goldset_dir'], "goldset_{goldset_uid}", "goldset.log")
+    resources:
+        mem_mb = lambda wildcards, attempt: (4 * attempt) * 1024
+    singularity:
+        Experiment.VCF_SINGULARITY_IMAGE
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+        ./scripts/midas.sh \
+            --tmpdir "{config[tmpdir]}" \
+            --max-mem-mb {resources.mem_mb} \
+            --reference {input.reference} \
+            {input.goldset_params} \
+            {output.snps} {output.indels} \
+            {input.chrom_vcf}
+        """
+
+rule all_vcf_goldset:
+    """produce a goldset for current experiment parameters"""
+    input:
+        lambda wildcards: expand(rules.call_vcf_goldset.output, goldset_uid=Experiment.goldset_uid)
+    run:
+        logger.run_info("Completed goldset VCFs. for call:%s" % (E.get_gold_params_by_uid(Experiment.goldset_uid)))
+        for infile in input:
+            logger.run_info("=> %s" % (infile,))
+
+rule all_vcf_chrom:
+    """produce one VCF per chromosome"""
+    input:
+        chrom_vcf =     lambda wildcards: _expand_chrom_prefix_by_id(Experiment.vcf_call_uid, Experiment.contig_list_uid, rules.call_vcf_chrom.output.chrom_vcf),
+        chrom_vcf_idx = lambda wildcards: _expand_chrom_prefix_by_id(Experiment.vcf_call_uid, Experiment.contig_list_uid, rules.call_vcf_chrom.output.chrom_vcf_idx)
+    run:
+        logger.run_info("Completed whole-chromosome VCFs for call:%s samples:%s contigs:%s" % (
+            Experiment.vcf_call_uid, Experiment.sample_slice_uid, Experiment.contig_list_uid))
+        for infile in input:
+            logger.run_info("=> %s" % (infile,))
+
+rule all_vcf_chrom_sites_only:
+    """procude one VCF per chromosome, filered for site-specific annotations only"""
+    input:
+        chrom_vcf =     lambda wildcards: _expand_chrom_prefix_by_id(Experiment.vcf_call_uid, Experiment.contig_list_uid, rules.call_vcf_chrom_sites_only.output.chrom_vcf),
+        chrom_vcf_idx = lambda wildcards: _expand_chrom_prefix_by_id(Experiment.vcf_call_uid, Experiment.contig_list_uid, rules.call_vcf_chrom_sites_only.output.chrom_vcf_idx),
+    run:
+        logger.run_info("Completed whole-chromosome sites-only VCFs for call:%s samples:%s contigs:%s" % (
+            Experiment.vcf_call_uid, Experiment.sample_slice_uid, Experiment.contig_list_uid))
+        for infile in input:
+            logger.run_info("=> %s" % (infile,))
+
+rule all_vcf_chrom_tar:
+    """merge all non-overlapping regions of the same chromosome into a
+       whole-chromosome vcf and bundle all those vcfs into a single tarball.
+    """
+    input:
+        # essentially all vcf tarballs
+        vcf_tar   = rules.all_vcf_batch.input.vcf_tar,
+        chrom_map = expand(rules.write_vcf_chrom_map.output, call_uid=Experiment.vcf_call_uid, contig_list_uid=Experiment.contig_list_uid),
+        reference=config['reference']
+    output:
+        chrom_tar = expand(os.path.join(config['jointcalldir'], "vcf_chrom_{call_uid}_{contig_list_uid}.tar"),
+                           call_uid=Experiment.vcf_call_uid, contig_list_uid=Experiment.contig_list_uid)
+    log:
+        expand("logs/all_vcf_chrom_{call_uid}_{contig_list_uid}.log",
+               call_uid=Experiment.vcf_call_uid,
+               contig_list_uid=Experiment.contig_list_uid)
+    singularity:
+        Experiment.VCF_SINGULARITY_IMAGE
+    threads: 32
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+
+        XTMP={config[tmpdir]}  # do not use local disk. not enough space. needs >2TB
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.all_vcf_chrom.XXXXXX);
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT; \
+
+        # determine call_uid from "vcf_CALLUID_INTERVAL_*"
+        call_uid=\\$(echo {input.vcf_tar[0]} | cut -d_ -f2)
+        destdir=\\${{workdir}}/chrom_\\${{call_uid}}_{config[contig_list_uid]}
+
+        mkdir -p \\$workdir/inputs \\$workdir/gatk \\$destdir/logs
+
+        ( set +x;
+          tarfiles=( {input.vcf_tar} )
+          time for ((i=0; i<\\${{#tarfiles[@]}}; i++)); do
+              echo "set -x; tar -C \\$workdir/inputs/ -xf \\${{tarfiles[i]}}";
+          done | \\${{CONDA_PREFIX}}/bin/parallel -j{threads}
+        )
+
+        declare -a chrom_contigs
+
+        # save logs from previous step
+        mv \\${{workdir}}/inputs/logs \\${{workdir}}/inputs/input_logs
+        tar -czf \\$destdir/logs/input_logs.tgz -C \\$workdir/inputs input_logs
+
+        # prefix for per-interval vcf input files
+        vcf_prefix="vcf_\\${{call_uid}}_"
+        while read -a chrom_contigs; do
+            chrom_name=\\${{chrom_contigs[0]}}
+            chrom_args=\\${{workdir}}/chrom_args_\\${{chrom_name}}.txt
+
+            # build arguments file
+            (
+                echo "-R {input.reference}"
+                echo "--TMP_DIR \\${{workdir}}/gatk"
+                for ((i=1; i < \\${{#chrom_contigs[@]}}; i++)); do
+                    echo "-I \\${{workdir}}/inputs/\\${{vcf_prefix}}\\${{chrom_contigs[i]}}.vcf.gz"
+                done
+            ) > \\${{chrom_args}}
+        done < {input.chrom_map}
+
+
+        function gather_chromosome () {{
+            # workdir, arguments, outfile, logfile
+            export HOME="\\$1"
+            (
+                set -x
+                /gatk/gatk GatherVcfs --arguments_file "\\$2" -O "\\$3"
+                \\${{CONDA_PREFIX}}/bin/tabix -p vcf "\\$3"
+            ) |& tee "\\$4"
+        }}
+        export -f gather_chromosome
+
+        while read -a chrom_name REST; do
+            chrom_args=\\${{workdir}}/chrom_args_\\${{chrom_name}}.txt
+            outname="\\${{chrom_name}}.vcf.gz"
+            logfile="\\$(basename \\${{outname}} .vcf.gz)".log
+
+            echo "gather_chromosome \\${{workdir}} \\${{chrom_args}} \\$destdir/\\$outname \\$destdir/logs/\\$logfile"
+        done < {input.chrom_map} | \\${{CONDA_PREFIX}}/bin/parallel -j{threads}
+
+        # create tarball in temp file of destination directory
+        tmpoutput={output.chrom_tar}.tmp\\$\\$
+        tar -cvf \\$tmpoutput -C \\$workdir \\$(basename \\$destdir)
+
+        # quick move to final location
+        mv -v \\$tmpoutput {output.chrom_tar}
+    """
+
+rule write_sample_info:
+    """output a list of rows:
+
+       bam, gvcf, samplename, 3-letter species, population, wild/cultivar, project_name
+
+    """
+    run:
+        import subprocess
+        import yaml
+        import json
+        import sys
+
+        #
+        # load database of extra data on population, project, and wild/cultivar
+        # FIXME all that metadata should be in the samples definitions
+        #
+        logger.run_info("Loading metadata...")
+        p = subprocess.Popen("scripts/sample_info.py",
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, shell=False)
+        outdata, errdata = p.communicate()
+
+        if errdata or p.returncode != 0:
+            logger.error("Problem loading metadata: %s" % errdata)
+            sys.exit(1)
+
+        metadata_obj = yaml.load(outdata)
+        logger.run_info("done.")
+        sample_metadata = metadata_obj.get("samples", {})
+
+        def _record(samplename):
+            bam  = expand(_merged_maybe(samplename, fmt="bam"), sample=samplename)[0]
+            gvcf = expand(rules.call_vc.output.gvcf, sample=samplename)[0]
+            meta = sample_metadata.get(samplename, {})
+            return {'bam': bam,
+                    'gvcf': gvcf,
+                    'name': samplename,
+                    'species': meta.get('species', '--'),
+                    'population': meta.get('population', '--'),
+                    'is_wild': meta.get('is_wild', '--'),
+                    'project': meta.get('project', '--')
+            }
+
+        output_file = expand(["./sample_info_file_{sample_slice_uid}.tsv"], sample_slice_uid=config['sample_slice_uid'])[0]
+        with open(output_file + ".tmp", "w+") as tmpfile:
+            fields = ("bam", "gvcf", "name", "species", "population", "is_wild", "project")
+            tmpfile.write("\t".join(fields) + "\n")
+            for samplename in config['sample_slice'].keys():
+                row = _record(samplename)
+                tmpfile.write("\t".join([row[fld] for fld in fields]) + "\n")
+        os.rename(output_file + ".tmp", output_file)
+        logger.run_info("generated %s" % (output_file,))
+
+        output_file = expand(["./sample_info_file_{sample_slice_uid}.json"], sample_slice_uid=config['sample_slice_uid'])[0]
+        with open(output_file + ".tmp", "w+") as tmpfile:
+            for samplename in config['sample_slice'].keys():
+                row = _record(samplename)
+                tmpfile.write(json.dumps(row) + "\n")
+        os.rename(output_file + ".tmp", output_file)
+        logger.run_info("generated %s" % (output_file,))
+
+
+# rule write_variant_model_vcf_list:
+#     """
+#     Writes a file containing the names of raw vcf.gz input files used
+#     in building the model.  This saves from passing thousands of
+#     filenames as command line arguments.
+#     """
+#     input:
+#         nada=_no_inputs,
+#     version:
+#         "1"
+#     output:
+#         temp(os.path.join(config['filtervcfdir'], "filter_vcf_chrom_list_{call_uid}_{contig_list_uid}.txt"))
+#     run:
+#         vcf_call_uid = wildcards.call_uid
+#         contig_list_uid = wildcards.contig_list_uid
+
+#         vcf_inputs = _all_vcf_chrom_by_id(vcf_call_uid, contig_list_uid)['chrom_vcf']
+
+#         with open(output[0] + ".tmp", "w+") as tmpfile:
+#             for vcf in vcf_inputs:
+#                 tmpfile.write(str(vcf) + "\n")
+#         os.rename(output[0] + ".tmp", output[0])
+
+def _get_chrom_prefix_group_ids(contig_list_uid, batch_size):
+    """returns a mapping from chromosome_group_id => list of chromosome prefixes"""
+
+    cached = _get_chrom_prefix_group_ids.cache.get((contig_list_uid, batch_size))
+    if cached:
+        return cached
+    non_empty_prefixes = _get_valid_chrom_prefixes(contig_list_uid)
+    batch_size = config.get('variant_model_batch_size', 4)
+
+    groups = OrderedDict()
+    for istart in range(0, len(non_empty_prefixes), batch_size):
+        chroms = non_empty_prefixes[istart:istart + batch_size]
+
+        #
+        # hash the list of chromosomes
+        #
+        with io.BytesIO() as datafile:
+            for chrom in sorted(chroms):
+                datafile.write((chrom + "\n").encode('utf-8'))
+            datafile.seek(0)
+            chrom_group_uid = config['paramsdb'].put_stream(datafile)
+        groups[chrom_group_uid] = chroms
+
+    _get_chrom_prefix_group_ids.cache[(contig_list_uid, batch_size)] = groups
+    return groups
+_get_chrom_prefix_group_ids.cache = {}
+
+
+def _get_variant_model_inputs(wildcards, fmt="chrom_vcf"):
+    """
+    get the per-chromosome vcf pathnames that will be generated and
+    belong to the group of chromosomes designated by wildcards
+
+    fmt is either chrom_vcf or chrom_vcf_idx
+    """
+
+    vcf_call_uid = wildcards.call_uid
+    contig_list_uid = wildcards.contig_list_uid
+    chrom_list_uid = wildcards.chrom_list_uid
+    all_groups = _get_chrom_prefix_group_ids(contig_list_uid, config.get("variant_model_batch_size", 4))
+
+    chrom_prefixes = all_groups[chrom_list_uid]
+
+    return expand(rules.call_vcf_chrom_sites_only.output[fmt],
+                  call_uid=vcf_call_uid,
+                  contig_list_uid=contig_list_uid,
+                  chrom_prefix=chrom_prefixes)
+
+rule call_variant_model:
+    """Produces a recalibration model computed over raw SNPs in regions spanning a group of chromosomes"""
+    input:
+        vcf      = lambda wildcards: _get_variant_model_inputs(wildcards, fmt='chrom_vcf'),
+        vcf_idx  = lambda wildcards: _get_variant_model_inputs(wildcards, fmt='chrom_vcf_idx'),
+        goldset  = lambda wildcards: config['goldset_snps'] if wildcards.model_type == "snps" else config['goldset_indels']
+    output:
+        model    = os.path.join(config['filtervcfdir'], "partial_variant_model_{model_type}_{call_uid}_{contig_list_uid}_{chrom_list_uid}.tgz"),
+    log:
+        os.path.join(config['filtervcfdir'], "partial_variant_model_{model_type}_{call_uid}_{contig_list_uid}_{chrom_list_uid}.tgz.log")
+    singularity:
+        E.ExperimentParams.VARIANT_MODEL_SINGULARITY_IMAGE
+    threads: 2
+    resources:
+        mem_mb = lambda wildcards, attempt: (100 + 20 * attempt) * 1024
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+        ./scripts/recalibrate_pt1.sh \
+            --gold-{wildcards.model_type} {input.goldset} \
+            --tmpdir {config[tmpdir]} \
+            --max-mem-mb {resources.mem_mb} \
+            {output.model} \
+            {input.vcf}
+        """
+
+def _get_all_variant_models(call_uid, contig_list_uid):
+    """obtain models for snps and indels for all model-batches"""
+
+    chrom_prefix_groups = _get_chrom_prefix_group_ids(contig_list_uid, config.get("variant_model_batch_size", 4))
+
+    return {
+        "snps": expand(rules.call_variant_model.output,
+                       call_uid=call_uid,
+                       contig_list_uid=contig_list_uid,
+                       chrom_list_uid=[chrom_list_uid for chrom_list_uid in chrom_prefix_groups.keys()],
+                       model_type="snps"),
+
+        "indels": expand(rules.call_variant_model.output,
+                         call_uid=call_uid,
+                         contig_list_uid=contig_list_uid,
+                         chrom_list_uid=[chrom_list_uid for chrom_list_uid in chrom_prefix_groups.keys()],
+                         model_type="indels")
+    }
+
+
+rule call_gather_tranches:
+    """Optional step. If VariantRecalibrator was called in batches, then the tranches need to be gathered.
+
+       FIXME: not tested
+    """
+    input:
+        unpack(lambda wildcards: _get_all_variant_models(wildcards.call_uid, wildcards.contig_list_uid))
+    output:
+        snps   = os.path.join(config['filtervcfdir'], "variant_model_{call_uid}_{contig_list_uid}.snps.gathered.tranches"),
+        indels = os.path.join(config['filtervcfdir'], "variant_model_{call_uid}_{contig_list_uid}.indels.gathered.tranches"),
+    resources:
+        mem_mb = lambda wildcards, attempt: (20 + 10 * attempt) * 1024
+    threads: 2
+    singularity:
+        rules.call_vcf.singularity_img
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+        ./scripts/recalibrate_pt1_gather.sh \
+            --tmpdir {config[tmpdir]} \
+            --max-mem-mb {resources.mem_mb} \
+            {output.snps} {output.indels} \
+            {input}
+        """
+
+def _get_filter_model_recal(vcf_call_uid, contig_list_uid, chrom_prefix, model_type="snps"):
+    """find the recal file(s) obtained for the corresponding chrom_prefix
+
+       When applying VQSR over a region, the recal file applied needs
+       to be the same as that obtained during the VariantRecalibrator
+       pass over that region.
+    """
+    chrom_prefix_groups = _get_chrom_prefix_group_ids(contig_list_uid, config.get("variant_model_batch_size", 4))
+
+    for group_id, chrom_prefixes in chrom_prefix_groups.items():
+        if chrom_prefix in chrom_prefixes:
+            return expand(rules.call_variant_model.output,
+                          call_uid=vcf_call_uid,
+                          contig_list_uid=contig_list_uid,
+                          chrom_list_uid=group_id,
+                          model_type=model_type)
+    else:
+        raise Exception("Could not find variant model that covers chromosome {}".format(chrom_prefix))
+
+def _get_filter_tranches(call_uid, contig_list_uid):
+    """if variant recalibration has been performed in batches. The
+        tranches file to use in variant recalibration should be the
+        same gathered tranches file over all these batches.
+
+        if variant recalibration has been performed in one single
+        pass, then the recal and tranches file to use is the same
+        across the genome.
+    """
+    cached = _get_filter_tranches.cache.get((call_uid, contig_list_uid))
+    if cached is not None:
+        return cached
+
+    variant_models = _get_all_variant_models(call_uid, contig_list_uid)
+    snp_models, indel_models = variant_models['snps'], variant_models['indels']
+
+    tranche_files = []
+    if len(snp_models) > 1:
+        logger.run_info("{} tranches for snps need to be gathered.".format(len(snp_models)))
+        tranche_files += rules.call_gather_tranches.output.snps
+    else:
+        logger.run_info("only 1 tranches file generated for snps. no need to gather. (classic single-pass method)")
+
+    if len(indel_models) > 1:
+        logger.run_info("{} tranches for indels need to be gathered.".format(len(snp_models)))
+        tranche_files += rules.call_gather_tranches.output.snps
+    else:
+        logger.run_info("only 1 tranches file generated for indels. no need to gather. (classic single-pass method)")
+
+    _get_filter_tranches.cache[(call_uid, contig_list_uid)] = tranche_files
+    return tranche_files
+
+_get_filter_tranches.cache = {}
+
+rule call_vqsr_vcf:
+    """
+    Applies VQSR on raw snps using a recalibration model. One file per chromosome.
+    """
+    input:
+        vcf          = rules.call_vcf_chrom_excess_het.output.chrom_vcf,     # raw vcf
+        vcf_idx      = rules.call_vcf_chrom_excess_het.output.chrom_vcf_idx, # raw vcf_id
+        tranches     = lambda wildcards: _get_filter_tranches(wildcards.call_uid, wildcards.contig_list_uid),
+        model_snps   = lambda wildcards: _get_filter_model_recal(wildcards.call_uid, wildcards.contig_list_uid, wildcards.chrom_prefix, model_type="snps"),
+        model_indels = lambda wildcards: _get_filter_model_recal(wildcards.call_uid, wildcards.contig_list_uid, wildcards.chrom_prefix, model_type="indels"),
+    output:
+        vcf     = os.path.join(config['filtervcfdir'], "chrom_{call_uid}_{contig_list_uid}", "vqsr_{tranchevalues}_{chrom_prefix}.vcf.gz"),
+        vcf_idx = os.path.join(config['filtervcfdir'], "chrom_{call_uid}_{contig_list_uid}", "vqsr_{tranchevalues}_{chrom_prefix}.vcf.gz.tbi")
+    log:
+        os.path.join(config['filtervcfdir'], "chrom_{call_uid}_{contig_list_uid}", "vqsr_{tranchevalues}_{chrom_prefix}.vcf.gz.log")
+    threads: 1
+    singularity:
+        Experiment.VC_SINGULARITY_IMAGE
+    resources:
+        mem_mb=lambda wildcards, attempt: (5 + 5 * attempt) * 1024
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+
+        ARGS=(
+           --model-snps    {input.model_snps}
+           --model-indels  {input.model_indels}
+        )
+        tranches=( {input.tranches} )
+        if [[ \\${{#tranches[@]}} -gt 1 ]]; then
+            ARGS+=(
+               --tranches-snps   \\${{tranches[0]}}
+               --tranches-indels \\${{tranches[1]}}
+            )
+        elif [[ \\${{#tranches[@]}} -gt 0 ]]; then
+           ARGS+=(
+               --tranches-snps   \\${{tranches[0]}}
+            )
+        fi
+        ./scripts/recalibrate_pt2.sh \
+            "\\${{ARGS[@]}}" \
+            --tmpdir {config[tmpdir]} \
+            --max-mem-mb \\$(({resources.mem_mb} - 2048)) \
+            {output.vcf} \
+            {input.vcf}
+        """
+
+rule write_vcf_filter_params:
+    """write information about the parameters used in a VCF filer"""
+    input:
+        nada=_no_inputs,
+    output:
+        paramsfile=os.path.join(config['filtervcfdir'],
+                                "filtered_{call_uid}_{contig_list_uid}",
+                                "filterparams_{filter_name}_{filter_uid}.txt")
+    version: "v1"
+    log:
+        os.path.join(config['filtervcfdir'], "filtered_{call_uid}_{contig_list_uid}", "filterparams_{filter_name}_{filter_uid}.txt.log")
+    run:
+        import sys, os
+        U.mkdirp(os.path.dirname(str(log)))
+        sys.stderr = open(str(log), "w", encoding="utf-8")
+
+        filter_obj = E.VcfFilter.from_filter_uid(wildcards.filter_uid)
+        output_file = output.paramsfile
+
+        U.mkdirp(os.path.dirname(output_file))
+        with open(output_file + ".tmp", "w+") as tmpfile:
+            tmpfile.write("\n".join(filter_obj.params['gatk_args']))
+            if filter_obj.params['gatk_args']:
+                # trailing newline
+                tmpfile.write("\n")
+
+        os.rename(output_file + ".tmp", output_file)
+        logger.run_info("generated %s" % (output_file,))
+
+rule call_filter_vcf:
+    """applies a custom filter over a recalibrated (VQSR) VCF file. One file per chromosome prefix."""
+    input:
+        vcf     = rules.call_vqsr_vcf.output.vcf,
+        vcf_idx = rules.call_vqsr_vcf.output.vcf_idx,
+        paramsfile = rules.write_vcf_filter_params.output.paramsfile
+    output:
+        vcf     = os.path.join(config['filtervcfdir'],
+                               "chrom_{call_uid}_{contig_list_uid}",
+                               "filter_{filter_name}_{tranchevalues}_{filter_uid}_{chrom_prefix}.vcf.gz"),
+        vcf_idx = os.path.join(config['filtervcfdir'],
+                               "chrom_{call_uid}_{contig_list_uid}",
+                               "filter_{filter_name}_{tranchevalues}_{filter_uid}_{chrom_prefix}.vcf.gz.tbi")
+    log:
+        os.path.join(config['filtervcfdir'],
+                     "chrom_{call_uid}_{contig_list_uid}",
+                     "filter_{filter_name}_{tranchevalues}_{filter_uid}_{chrom_prefix}.vcf.gz.log")
+    threads: 1
+    singularity:
+        Experiment.VC_SINGULARITY_IMAGE
+    resources:
+        mem_mb=lambda wildcards, attempt: (4 + 4 * attempt) * 1024
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+        CFGTMP={config[tmpdir]}
+        XTMP=\\${{SLURM_TMPDIR:-\\$CFGTMP}} # use local disk if on cluster
+        mkdir -p "\\$XTMP";
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.filter_vcf.XXXXXX);
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT;
+
+        :
+        : filter parameters
+        :
+        cat {input.paramsfile}
+
+        GATK_MB=\\$(({resources.mem_mb} - 256))
+        FILTER_ARGS=()
+        while read LINE; do
+            FILTER_ARGS+=("\\$LINE")
+        done < {input.paramsfile}
+
+        HOME=\\${{workdir}} /gatk/gatk SelectVariants \
+          --java-options "-Xmx\\${{GATK_MB}}m -DGATK_STACKTRACE_ON_USER_EXCEPTION=true" \
+          -V {input.vcf} \
+          -O \\$workdir/\\$(basename {output.vcf}) \
+          "\\${{FILTER_ARGS[@]}}"
+
+        # move to final location
+        mkdir -p \\$(dirname {output.vcf})
+        mv -v \\${{workdir}}/\\$(basename {output.vcf}){{,.tbi}} \\$(dirname {output.vcf})/
+"""
+
+def _get_gather_vcf_filtered_inputs(filter_uid):
+    """Get a dictionary of all per-chrom files output from filtering run `filter_uid`"""
+
+    vcf_filter = E.VcfFilter.from_filter_uid(filter_uid)
+    expansions = {
+        'tranchevalues': vcf_filter.params['tranchevalues'],
+        'filter_name': vcf_filter.params['filter_name'],
+        'filter_uid': filter_uid
+    }
+    contig_list_uid = vcf_filter.params['contig_list_uid']
+    vcf_call_uid = vcf_filter.params['vcf_call_uid']
+
+    exclude_chrom_prefixes = vcf_filter.params.get('exclude_chrom_prefixes', [])
+    for exclusion in exclude_chrom_prefixes:
+        logger.run_info("Skipping filtering of chromosomes %s* ..." % (exclusion,))
+
+    return {
+        'vcf': _expand_chrom_prefix_by_id(vcf_call_uid, contig_list_uid, rules.call_filter_vcf.output.vcf,
+                                          _exclude_prefixes=exclude_chrom_prefixes, **expansions),
+        'vcf_idx': _expand_chrom_prefix_by_id(vcf_call_uid, contig_list_uid, rules.call_filter_vcf.output.vcf_idx,
+                                              _exclude_prefixes=exclude_chrom_prefixes, **expansions)
+    }
+
+rule gather_vcf_filtered:
+    """gather filtered VCFs into a single (large) VCF file"""
+    input:
+        unpack(U.log_exc(lambda wildcards: _get_gather_vcf_filtered_inputs(wildcards.filter_uid), logger))
+    output:
+        vcf = os.path.join(config['filtervcfdir'],
+                           "filtered_{call_uid}_{contig_list_uid}",
+                           "gather_{filter_name}_{filter_uid}.vcf.gz"),
+        vcf_idx = os.path.join(config['filtervcfdir'],
+                               "filtered_{call_uid}_{contig_list_uid}",
+                               "gather_{filter_name}_{filter_uid}.vcf.gz.tbi")
+    log:
+        os.path.join(config['filtervcfdir'],
+                     "filtered_{call_uid}_{contig_list_uid}",
+                     "gather_{filter_name}_{filter_uid}.vcf.gz.log")
+    threads: 1
+    singularity:
+        Experiment.VC_SINGULARITY_IMAGE
+    resources:
+        mem_mb=lambda wildcards, attempt: (4 + 4 * attempt) * 1024
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+        CFGTMP={config[tmpdir]}
+        XTMP=\\${{SLURM_TMPDIR:-\\$CFGTMP}} # use local disk if on cluster
+        mkdir -p "\\$XTMP";
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.filter_vcf.XXXXXX);
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT;
+
+        GATK_MB=\\$(({resources.mem_mb} - 256))
+
+        inputs=()
+        set +x
+        for i in {input.vcf}; do
+           inputs+=(-I "\\$i")
+        done
+        set -x
+
+        HOME=\\${{workdir}} /gatk/gatk GatherVcfs \
+          --java-options "-Xmx\\${{GATK_MB}}m -DGATK_STACKTRACE_ON_USER_EXCEPTION=true" \
+          \\${{inputs[@]}} \
+          -O \\$workdir/\\$(basename {output.vcf})
+
+	HOME=\${{workdir}} /gatk/gatk IndexFeatureFile \
+          --java-options "-Xmx\\${{GATK_MB}}m -DGATK_STACKTRACE_ON_USER_EXCEPTION=true" \
+          -F "\\${{workdir}}/\\$(basename {output.vcf})"
+
+        # move to final location
+        mv -v \\${{workdir}}/\\$(basename {output.vcf}){{,.tbi}} \\$(dirname {output.vcf})/
+"""
+
+rule write_beagle_params:
+    """write information about the parameters used in a VCF filer"""
+    input:
+        nada=_no_inputs,
+    output:
+        paramsfile=os.path.join(config['filtervcfdir'],
+                                "filtered_{call_uid,[^_.]+}_{contig_list_uid,[^_.]+}",
+                                "beagleparams_{beagle_uid,[^_.]+}_{filter_uid,[^_.]+}_{filter_name}.json")
+    log:
+        os.path.join(config['filtervcfdir'], "beagle_{beagle_uid}", "filterparams_{beagle_uid}.txt.log")
+    run:
+        import sys, os
+        U.mkdirp(os.path.dirname(str(log)))
+        sys.stderr = open(str(log), "w", encoding="utf-8")
+
+        call_obj = E.BeagleCall.from_beagle_uid(wildcards.beagle_uid)
+        output_file = output.paramsfile
+
+        U.mkdirp(os.path.dirname(output_file))
+        with open(output_file + ".tmp", "w+") as tmpfile:
+            tmpfile.write(call_obj.to_params())
+            tmpfile.write("\n")
+
+        os.rename(output_file + ".tmp", output_file)
+        logger.run_info("generated %s" % (output_file,))
+
+rule call_beagle:
+    """perform inputation of filtered vcf with beagle"""
+    input:
+        vcf = rules.call_filter_vcf.output.vcf,
+        vcf_idx = rules.call_filter_vcf.output.vcf_idx,
+        paramsfile = rules.write_beagle_params.output.paramsfile
+    output:
+        vcf     = os.path.join(config['filtervcfdir'],
+                               "chrom_{call_uid}_{contig_list_uid}",
+                               "beagle_{beagle_uid}_{tranchevalues}_{filter_uid}_{chrom_prefix,[^_.]+}_{filter_name}.vcf.gz"),
+        vcf_idx = os.path.join(config['filtervcfdir'],
+                               "chrom_{call_uid}_{contig_list_uid}",
+                               "beagle_{beagle_uid}_{tranchevalues}_{filter_uid}_{chrom_prefix,[^_.]+}_{filter_name}.vcf.gz.tbi"),
+        tped    = os.path.join(config['filtervcfdir'],
+                               "chrom_{call_uid}_{contig_list_uid}",
+                               "beagle_{beagle_uid}_{tranchevalues}_{filter_uid}_{chrom_prefix,[^_.]+}_{filter_name}.tped"),
+        tfam    = os.path.join(config['filtervcfdir'],
+                               "chrom_{call_uid}_{contig_list_uid}",
+                               "beagle_{beagle_uid}_{tranchevalues}_{filter_uid}_{chrom_prefix,[^_.]+}_{filter_name}.tfam")
+    log:
+        os.path.join(config['filtervcfdir'],
+                     "chrom_{call_uid}_{contig_list_uid}",
+                     "beagle_{beagle_uid}_{tranchevalues}_{filter_uid}_{chrom_prefix}_{filter_name}.vcf.gz.log")
+    threads: 12
+    singularity:
+        Experiment.BEAGLE_SINGULARITY_IMAGE
+    resources:
+        mem_mb=lambda wildcards, attempt: (30 + 10 * attempt) * 1024
+    shell:
+        """
+        mkdir -p \\$(dirname {log}) || :
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+        CFGTMP={config[tmpdir]}
+        XTMP=\\${{SLURM_TMPDIR:-\\$CFGTMP}} # use local disk if on cluster
+        mkdir -p "\\$XTMP";
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.beagle.XXXXXX);
+        trap 'find \\${{workdir}} || : ; rm --one-file-system -r -- \\${{workdir}}' EXIT;
+
+        :
+        : parameters
+        :
+        cat {input.paramsfile}
+        beagle_url=\\$(scripts/read_json_key beagle_url < {input.paramsfile})
+        beagle_sha1=\\$(scripts/read_json_key beagle_sha1 < {input.paramsfile})
+        beagle_args=( "\\$(scripts/read_json_key beagle_args < {input.paramsfile})" )
+        beagle_map=\\$(scripts/read_json_key recombination_map < {input.paramsfile})
+
+        # download beagle (if needed) FIXME -- update docker container
+        if [[ ! -f {config[tmpdir]}/beagle/\\${{beagle_sha1}}.jar ]]; then
+            wget -O \\${{workdir}}/beagle.jar "\\${{beagle_url}}"
+            match=\\$(sha1sum - < \\${{workdir}}/beagle.jar | cut -d' ' -f 1)
+            if [[ \\${{beagle_sha1}} != \\$match ]]; then
+                echo "beagle mismatch"
+            fi
+            mkdir -p {config[tmpdir]}/beagle/
+            mv \\${{workdir}}/beagle.jar {config[tmpdir]}/beagle/\\${{beagle_sha1}}.jar
+        fi
+        JAVA_MB=\\$(({resources.mem_mb} - 256))
+        time java -Xmx\\${{JAVA_MB}}m -jar {config[tmpdir]}/beagle/\\${{beagle_sha1}}.jar \
+            gt={input.vcf} \
+            out=\\${{workdir}}/\\$(basename {output.vcf} .vcf.gz) \
+            "\\${{beagle_args[@]}}" \
+            nthreads={threads} \
+            map=\\${{beagle_map}}
+        \\${{CONDA_PREFIX}}/bin/tabix -p vcf \\${{workdir}}/\\$(basename {output.vcf})
+
+        time \\${{CONDA_PREFIX}}/bin/plink \
+            --vcf \\${{workdir}}/\\$(basename {output.vcf}) \
+            --recode transpose 12 \
+            --set-missing-var-ids @:# \
+            --double-id \
+            --allow-extra-chr \
+            --out \\${{workdir}}/\\$(basename {output.vcf} .vcf.gz)
+
+        # downstream analysis requires that chromosomeids be numbers, not chromosome names
+        sed -i -e 's/HanXRQChr//g' \\${{workdir}}/\\$(basename {output.vcf} .vcf.gz).tped
+
+        # move outputs to target location
+        rm -f {output.vcf} {output.vcf_idx} {output.tped} {output.tfam} | :
+        mv \\${{workdir}}/\\$(basename {output.vcf} .vcf.gz){{.vcf.gz,.vcf.gz.tbi,.tped,.tfam}} \\$(dirname {output.vcf})
+"""
+
+def _get_vcf_chrom_beagle_results(beagle_uid):
+    """get a dictionary of all per-chrom vcf files output by beagle"""
+
+    beagle = E.BeagleCall.from_beagle_uid(beagle_uid)
+    vcf_filter_uid = beagle.params['vcf_filter_uid']
+    vcf_filter = E.VcfFilter.from_filter_uid(vcf_filter_uid)
+    expansions = {
+        'tranchevalues': vcf_filter.params['tranchevalues'],
+        'filter_name': vcf_filter.params['filter_name'],
+        'filter_uid': vcf_filter_uid,
+        'beagle_uid': beagle_uid
+    }
+    contig_list_uid = vcf_filter.params['contig_list_uid']
+    vcf_call_uid = vcf_filter.params['vcf_call_uid']
+
+    exclude_chrom_prefixes = vcf_filter.params.get('exclude_chrom_prefixes', [])
+    for exclusion in exclude_chrom_prefixes:
+        logger.run_info("Skipping filtering of chromosomes %s* ..." % (exclusion,))
+
+    return { k: _expand_chrom_prefix_by_id(vcf_call_uid, contig_list_uid, rules.call_beagle.output[k],
+                                           _exclude_prefixes=exclude_chrom_prefixes, **expansions)
+             for k in ["vcf", "vcf_idx", "tped", "tfam"]
+    }
+
+rule all_vcf_chrom_beagle:
+    """
+    Get per-chrom beagle files
+    """
+    input:
+        unpack(U.log_exc(lambda wildcards: _get_vcf_chrom_beagle_results(Experiment.beagle_call_uid), logger))
+    run:
+        beagle = E.BeagleCall.from_beagle_uid(Experiment.beagle_call_uid)
+        vcf_filter = E.VcfFilter.from_filter_uid(beagle.params['vcf_filter_uid'])
+        logger.run_info("""Completed per-chrom Beagle calls  SNPs for:
+  beagle_call_uid:%(beagle_call_uid)s
+  vcf_filter_uid:%(vcf_filter_uid)s
+  vcf_filter_name:%(vcf_filter_name)s
+  vcf_call_uid:%(vcf_call_uid)s
+  sample_slice_uids:%(sample_slice_uid)s
+  contigs:%(contig_list_uid)s
+  """ % {
+            'beagle_call_uid': Experiment.beagle_call_uid,
+            'vcf_filter_uid': beagle.params['vcf_filter_uid'],
+            'vcf_filter_name': vcf_filter.params['filter_name'],
+            'vcf_call_uid': vcf_filter.params['vcf_call_uid'],
+            'sample_sice_uid': Experiment.sample_slice_uid,
+            'config_list_uid': vcf_filter.params['contig_list_uid']
+        })
+        for fil in input:
+            logger.run_info(" => " + fil)
+
+rule gather_vcf_beagle:
+    """gather outputs of per-chrom beagle runs into a single (large) VCF file"""
+    input:
+        unpack(U.log_exc(lambda wildcards: _get_vcf_chrom_beagle_results(wildcards.beagle_uid), logger))
+    output:
+        vcf = os.path.join(config['filtervcfdir'],
+                           "filtered_{call_uid,[^_.]+}_{contig_list_uid,[^_.]+}",
+                           "beagle_{beagle_uid,[^_.]+}_{tranchevalues}_{filter_uid,[^_.]+}_{filter_name}.vcf.gz"),
+        vcf_idx = os.path.join(config['filtervcfdir'],
+                               "filtered_{call_uid,[^_.]+}_{contig_list_uid,[^_.]+}",
+                               "beagle_{beagle_uid,[^_.]+}_{tranchevalues}_{filter_uid,[^_.]+}_{filter_name}.vcf.gz.tbi"),
+        tped = os.path.join(config['filtervcfdir'],
+                            "filtered_{call_uid,[^_.]+}_{contig_list_uid,[^_.]+}",
+                            "beagle_{beagle_uid,[^_.]+}_{tranchevalues}_{filter_uid,[^_.]+}_{filter_name}.tped"),
+    log:
+        vcf_idx = os.path.join(config['filtervcfdir'],
+                               "filtered_{call_uid,[^_.]+}_{contig_list_uid,[^_.]+}",
+                               "beagle_{beagle_uid,[^_.]+}_{tranchevalues}_{filter_uid,[^_.]+}_{filter_name}.vcf.gz.log")
+    threads: 1
+    singularity:
+        Experiment.VC_SINGULARITY_IMAGE
+    resources:
+        mem_mb=lambda wildcards, attempt: (4 + 4 * attempt) * 1024
+    shell:
+        """
+        exec >>{log} 2>&1; set -x; ulimit -c 0; ulimit -Hc 0;
+        CFGTMP={config[tmpdir]}
+        XTMP=\\${{SLURM_TMPDIR:-\\$CFGTMP}} # use local disk if on cluster
+        mkdir -p "\\$XTMP";
+        workdir=\\$(mktemp -d -p \\$XTMP tmp.filter_vcf.XXXXXX);
+        trap 'rm --one-file-system -r \\${{workdir}}' EXIT;
+
+        GATK_MB=\\$(({resources.mem_mb} - 256))
+
+        inputs=()
+        set +x
+        for i in {input.vcf}; do
+           inputs+=("\\$i")
+        done
+        set -x
+
+        # The VCFs output by Beagle have no #contig headers,
+        # and the Gatk picard tool depends on those for merging.
+        #HOME=\\${{workdir}} /gatk/gatk GatherVcfs \
+        #  --java-options "-Xmx\\${{GATK_MB}}m -DGATK_STACKTRACE_ON_USER_EXCEPTION=true" \
+        #  \\${{inputs[@]}} \
+        #  --CREATE_INDEX false \
+        #  -O \\$workdir/\\$(basename {output.vcf})
+
+        \\${{CONDA_PREFIX}}/bin/bcftools concat -O z -o "\\${{workdir}}/\\$(basename {output.vcf})" "\\${{inputs[@]}}"
+
+	HOME=\${{workdir}} /gatk/gatk IndexFeatureFile \
+          --java-options "-Xmx\\${{GATK_MB}}m -DGATK_STACKTRACE_ON_USER_EXCEPTION=true" \
+          -F "\\${{workdir}}/\\$(basename {output.vcf})"
+
+        cat {input.tped} > \\${{workdir}}/\\$(basename {output.tped})
+        # move to final location
+        mv -v \\${{workdir}}/\\$(basename {output.vcf} .vcf.gz){{.vcf.gz,.vcf.gz.tbi,.tped}} \\$(dirname {output.vcf})/
+"""
+
+
+rule all_vcf_chrom_vqsr:
+    """
+    Get VQSR per-chrom VCF files
+    """
+    input:
+        vcf     = lambda wildcards: _expand_chrom_prefix_by_id(Experiment.vcf_call_uid, Experiment.contig_list_uid, rules.call_vqsr_vcf.output.vcf, tranchevalues=Experiment.tranchevalues),
+        vcf_idx = lambda wildcards: _expand_chrom_prefix_by_id(Experiment.vcf_call_uid, Experiment.contig_list_uid, rules.call_vqsr_vcf.output.vcf_idx, tranchevalues=Experiment.tranchevalues)
+    run:
+        logger.run_info("Completed VQSR SNPs for call:%s samples:%s contigs:%s" % (
+            Experiment.vcf_call_uid, Experiment.sample_slice_uid, Experiment.contig_list_uid))
+        for fil in input:
+            logger.run_info(" => " + fil)
+
+
+def _all_vcf_gather_filtered_results(wildcards):
+    filters_to_apply = [Experiment.vcf_filter_uid]
+    inputs = {
+        'vcf': [],
+        'vcf_idx': []
+    }
+
+    for filter_uid in filters_to_apply:
+        vcf_filter = E.VcfFilter.from_filter_uid(filter_uid)
+        logger.run_info("Will apply filter %s: %s..." % (filter_uid, str(vcf_filter.params)[:1000]))
+
+        expansions = {
+            'call_uid': vcf_filter.params['vcf_call_uid'],
+            'contig_list_uid': vcf_filter.params['contig_list_uid'],
+            'filter_name': vcf_filter.params['filter_name'],
+            'filter_uid': filter_uid
+        }
+        inputs['vcf'] += expand(rules.gather_vcf_filtered.output.vcf, **expansions)
+        inputs['vcf_idx'] += expand(rules.gather_vcf_filtered.output.vcf_idx, **expansions)
+    return inputs
+
+rule all_vcf_gather_filtered:
+    """produce one VCF file containing the final filtered variants"""
+    input:
+        unpack(U.log_exc(_all_vcf_gather_filtered_results, logger))
+    run:
+        logger.run_info("Ran all filters.")
+        for infile in input.vcf:
+            logger.run_info("=> %s" % (infile,))
+
+
+def _all_beagle_gather_inputs(beagle_uid):
+    beagle = E.BeagleCall.from_beagle_uid(beagle_uid)
+    vcf_filter_uid = beagle.params['vcf_filter_uid']
+    vcf_filter = E.VcfFilter.from_filter_uid(vcf_filter_uid)
+    expansions = {
+        'tranchevalues': vcf_filter.params['tranchevalues'],
+        'filter_name': vcf_filter.params['filter_name'],
+        'filter_uid': vcf_filter_uid,
+        'beagle_uid': beagle_uid,
+        'contig_list_uid': vcf_filter.params['contig_list_uid'],
+        'call_uid': vcf_filter.params['vcf_call_uid']
+    }
+
+    # FIXME patch snakemake with safe expand() -- a version that removes placeholder regexes
+    vcf_template, _ = re.subn(r'{([^{},]+)(,[^}]+)?}', lambda m: "{" + m.group(1) + "}", rules.gather_vcf_beagle.output.vcf)
+    vcf_idx_template, _ = re.subn(r'{([^{},]+)(,[^}]+)?}', lambda m: "{" + m.group(1) + "}", rules.gather_vcf_beagle.output.vcf_idx)
+    return {
+        'vcf': expand(vcf_template, **expansions),
+        'vcf_idx': expand(vcf_idx_template, **expansions)
+    }
+
+rule all_beagle_gather:
+    """produce beagle-phased VCF"""
+    input:
+        unpack(U.log_exc(lambda wildcards: _all_beagle_gather_inputs(Experiment.beagle_call_uid), logger))
+    run:
+        logger.run_info("Beagle outputs gathered:...")
+        for infile in input.vcf:
+            logger.run_info("=> %s" % (infile,))
+
+# FIXME -- load order.
+logger.run_info("config %20s: %s" % ('vcf_call_uid', Experiment.vcf_call_uid))

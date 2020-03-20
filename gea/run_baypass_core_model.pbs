@@ -1,0 +1,33 @@
+#!/bin/bash
+#PBS -S /bin/bash
+#PBS -l mem=6000mb
+#PBS -l nodes=1:ppn=2
+#PBS -l walltime=05:00:00
+#PBS -m bea
+ 
+### Baypass CORE model ###
+### bash script ###
+ 
+cd $PBS_O_WORKDIR
+echo "Current working directory is `pwd`"
+echo "Running on hostname `hostname`"   
+ 
+CORES=`/bin/awk 'END {print NR}' $PBS_NODEFILE`
+echo "Running on $CORES cores."
+ 
+# Make the intel environment available on Orcinus
+module load intel
+
+## Directories:
+# Locate the input data
+ROOT_DIR=/home/gowens/data/baypass/core_runs/ann
+GENO=${ROOT_DIR}/annuus.random1.10K.BAYPASS.70pops.tab.table
+
+# Output directory
+OUTPUT_DIR=${ROOT_DIR}/baypass_CORE_output_invfree
+  
+echo "Starting BayPass at: `date`"
+ 
+i_baypass -npop 70 -gfile ${GENO} -nthreads ${PBS_NUM_PPN} -outprefix ${OUTPUT_DIR}/random1_anacore
+ 
+echo "Program finished with exit code $? at: `date`"

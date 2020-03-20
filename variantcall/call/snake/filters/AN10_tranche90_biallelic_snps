@@ -1,0 +1,23 @@
+#
+#
+# Select SNPs with:
+#   AN > 0.10 * Nindividuals * 2
+#   biallellic snps, AF > 0.01
+#
+# (Nindividuals * 2 is number of chromosomes)
+#
+# Select tranche 90 and all lower tranches
+#
+# Filter arguments are given in the SelectVariants syntax.
+# https://software.broadinstitute.org/gatk/documentation/article.php?id=1255
+#
+# https://sourceforge.net/p/picard/code/HEAD/tree/trunk/src/java/org/broadinstitute/variant/variantcontext/VariantContext.java#l672
+
+def get_filter(params):
+    return [
+    	"--restrict-alleles-to", "BIALLELIC",
+        "--select", "vc.isSNP()",
+        "--select", "AF > 0.01",
+	"--select", "vc.isNotFiltered() || vc.getFilters().contains('VQSRTrancheSNP50.00to70.00') || vc.getFilters().contains('VQSRTrancheSNP70.00to90.00')",
+	"--select", "AN > %d" % (int(params['MAX_AN'] * 0.1),)
+    ]
