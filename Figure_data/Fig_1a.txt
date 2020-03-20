@@ -100,58 +100,53 @@ ARG_27	argophyllus	35	27.14245	-98.14997
 ARG_28	argophyllus	40	27.00215	-98.13579
 ARG_29	argophyllus	35	27.10014	-98.14704
 ARG_30	argophyllus	30	27.25741	-97.94589
-PET_01	petiolaris	2140	35.1371	-111.64211
-PET_02	petiolaris	1445	34.91703	-111.90977
-PET_03	petiolaris	2075	35.33119	-111.54146
-PET_04	petiolaris	2166	35.39031	-111.57754
-PET_05	petiolaris	1755	35.15387	-109.50207
-PET_06	petiolaris	2110	35.51651	-105.68484
-PET_07	petiolaris	1795	36.49673	-104.57014
-PET_08	petiolaris	2545	37.52901	-105.297
-PET_09	petiolaris	2325	37.66278	-105.64088
-PET_10	petiolaris	2460	38.47747	-106.08848
-PET_11	petiolaris	2295	38.48952	-107.03795
-PET_12	petiolaris	1570	36.90004	-112.91885
-PET_13	petiolaris	1805	37.23794	-112.85064
-PET_14	petiolaris	2140	40.55035	-109.91641
-PET_15	petiolaris	2240	40.69709	-105.61168
-PET_16	petiolaris	1415	40.38047	-104.52282
-PET_17	petiolaris	1510	40.15158	-104.60307
-PET_18	petiolaris	1595	39.9137	-104.61456
-PET_19	petiolaris	1720	39.63705	-104.33484
-PET_20	petiolaris	585	38.3336	-98.83812
-PET_21	petiolaris	570	38.33349	-98.69159
-PET_22	petiolaris	465	38.56505	-97.96174
-PET_23	petiolaris	404	37.676	-97.40646
-PET_24	petiolaris	415	37.37939	-97.8877
-PET_25	petiolaris	415	36.83371	-98.6481
-PET_26	petiolaris	465	36.56341	-98.88941
-PET_27	petiolaris	470	36.558	-98.89537
-PET_28	petiolaris	350	36.79928	-98.24968
-PET_29	petiolaris	480	36.9134	-99.23544
-PET_30	petiolaris	660	36.40753	-99.55589
-PET_31	petiolaris	900	35.19473	-100.72366
-PET_32	petiolaris	1475	31.74298	-110.68913
-PET_33	petiolaris	1440	31.47593	-110.25758
-PET_34	petiolaris	1315	31.38092	-110.06893
-PET_35	petiolaris	1345	31.68887	-109.1337
-PET_36	petiolaris	1300	32.19631	-107.68668
-PET_37	petiolaris	1250	31.8201	-107.38806
-PET_38	petiolaris	1265	31.79005	-107.20421
-PET_39	petiolaris	1265	31.81152	-106.68289
-PET_40	petiolaris	1200	31.9985	-106.58418
-PET_41	petiolaris	1345	32.24206	-107.06309
-PET_42	petiolaris	1350	32.26828	-106.95863
-PET_43	petiolaris	1615	32.42618	-106.54787
-PET_44	petiolaris	1070	31.15031	-105.68665
-PET_45	petiolaris	1210	31.05622	-104.57134
-PET_46	petiolaris	765	31.43995	-102.87508
-PET_47	petiolaris	840	31.63659	-102.81704
-PET_48	petiolaris	840	31.71853	-103.03201
-PET_49	petiolaris	925	31.95354	-102.97878
-PET_50	petiolaris	905	32.50941	-102.04615
-Mon	petiolaris	NA	31.61642	-102.81197
-GSD	petiolaris	NA	37.773	-105.553
-SRD	anomalus	NA	38.60884	-110.58072
-LS	anomalus	NA	39.64008	-112.40065
-SBF	anomalus	NA	37.41145	-110.43126
+PET_01	petiolaris fallax	2140	35.1371	-111.64211
+PET_02	petiolaris fallax	1445	34.91703	-111.90977
+PET_03	petiolaris fallax	2075	35.33119	-111.54146
+PET_04	petiolaris fallax	2166	35.39031	-111.57754
+PET_05	petiolaris fallax	1755	35.15387	-109.50207
+PET_06	petiolaris fallax	2110	35.51651	-105.68484
+PET_07	petiolaris fallax	1795	36.49673	-104.57014
+PET_08	petiolaris fallax	2545	37.52901	-105.297
+PET_09	petiolaris fallax	2325	37.66278	-105.64088
+PET_10	petiolaris fallax	2460	38.47747	-106.08848
+PET_11	petiolaris fallax	2295	38.48952	-107.03795
+PET_12	petiolaris fallax	1570	36.90004	-112.91885
+PET_13	petiolaris fallax	1805	37.23794	-112.85064
+PET_14	petiolaris petiolaris	2140	40.55035	-109.91641
+PET_15	petiolaris petiolaris	2240	40.69709	-105.61168
+PET_16	petiolaris petiolaris	1415	40.38047	-104.52282
+PET_17	petiolaris petiolaris	1510	40.15158	-104.60307
+PET_18	petiolaris petiolaris	1595	39.9137	-104.61456
+PET_19	petiolaris petiolaris	1720	39.63705	-104.33484
+PET_20	petiolaris petiolaris	585	38.3336	-98.83812
+PET_21	petiolaris petiolaris	570	38.33349	-98.69159
+PET_22	petiolaris petiolaris	465	38.56505	-97.96174
+PET_23	petiolaris petiolaris	404	37.676	-97.40646
+PET_24	petiolaris petiolaris	415	37.37939	-97.8877
+PET_25	petiolaris petiolaris	415	36.83371	-98.6481
+PET_26	petiolaris petiolaris	465	36.56341	-98.88941
+PET_27	petiolaris petiolaris	470	36.558	-98.89537
+PET_28	petiolaris petiolaris	350	36.79928	-98.24968
+PET_29	petiolaris petiolaris	480	36.9134	-99.23544
+PET_30	petiolaris petiolaris	660	36.40753	-99.55589
+PET_31	petiolaris petiolaris	900	35.19473	-100.72366
+PET_32	petiolaris fallax	1475	31.74298	-110.68913
+PET_33	petiolaris fallax	1440	31.47593	-110.25758
+PET_34	petiolaris fallax	1315	31.38092	-110.06893
+PET_35	petiolaris fallax	1345	31.68887	-109.1337
+PET_36	niveus	1300	32.19631	-107.68668
+PET_37	niveus	1250	31.8201	-107.38806
+PET_38	niveus	1265	31.79005	-107.20421
+PET_39	niveus	1265	31.81152	-106.68289
+PET_40	niveus	1200	31.9985	-106.58418
+PET_41	niveus	1345	32.24206	-107.06309
+PET_42	niveus	1350	32.26828	-106.95863
+PET_43	petiolaris fallax	1615	32.42618	-106.54787
+PET_44	niveus	1070	31.15031	-105.68665
+PET_45	niveus	1210	31.05622	-104.57134
+PET_46	petiolaris fallax	765	31.43995	-102.87508
+PET_47	petiolaris fallax	840	31.63659	-102.81704
+PET_48	petiolaris fallax	840	31.71853	-103.03201
+PET_49	petiolaris fallax	925	31.95354	-102.97878
+PET_50	petiolaris fallax	905	32.50941	-102.04615
